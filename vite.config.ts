@@ -14,6 +14,21 @@ export default defineConfig({
   server: {
     host: true,
     allowedHosts: [".e2b.app"],
+    // The browser only ever calls same-origin "/api/..."; Vite forwards it to
+    // the Python control plane (api_server.py). Keeps the dashboard working
+    // behind remote previews, where "localhost" means the user's machine.
+    proxy: {
+      "/api": {
+        target: process.env.FXBOT_API_URL || "http://127.0.0.1:8787",
+        changeOrigin: true,
+        ws: false,
+        configure: (proxy) => {
+          proxy.on("error", () => {
+            /* control plane offline — the UI shows an "API offline" banner */
+          });
+        },
+      },
+    },
   },
   resolve: {
     alias: {

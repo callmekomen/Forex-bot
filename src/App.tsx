@@ -3,6 +3,7 @@ import { Background } from "./components/Background";
 import { TopBar, Ticker } from "./components/Chrome";
 import { Hero } from "./components/Hero";
 import { TradingDesk } from "./components/TradingDesk";
+import { LiveControl } from "./components/LiveControl";
 import { TelegramRemote } from "./components/TelegramRemote";
 import { Architecture } from "./components/Architecture";
 import { StrategyLab } from "./components/StrategyLab";
@@ -36,6 +37,8 @@ export default function App() {
         <Hero />
         <Divider />
         <TradingDesk />
+        <Divider />
+        <LiveControl />
         <Divider />
         <TelegramRemote />
         <Divider />
