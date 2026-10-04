@@ -1,0 +1,6 @@
+MetaTrader5>=5.0.45
+pandas>=2.0.0
+numpy>=1.24.0
+# Telegram remote control (telegram_control.py) uses the stdlib only — urllib.
+# No extra package required. Optional: pip install python-telegram-bot if you
+# prefer its webhook plumbing over the built-in long-poller.

@@ -1,0 +1,20 @@
+{
+  "saved_at": "2024-01-15T00:00:00+00:00",
+  "daily_date": "2024-01-15",
+  "daily_pnl": 0.0,
+  "current_balance": 10000.0,
+  "peak_balance": 10000.0,
+  "halted": false,
+  "halt_reason": "",
+  "open_positions": [],
+  "trade_log": [],
+  "config": {
+    "max_risk_per_trade": 0.02,
+    "max_daily_loss": 0.05,
+    "max_drawdown_limit": 0.15,
+    "max_open_positions": 3,
+    "min_confidence": 0.6,
+    "pairs": ["EUR/USD", "GBP/USD", "USD/JPY"],
+    "timeframe": "1h"
+  }
+}

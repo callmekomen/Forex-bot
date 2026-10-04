@@ -1,0 +1,38 @@
+# /etc/systemd/system/forex-bot.service
+#
+# Linux host: paper/mock loop, the dashboard, or the dashboard + a broker bridge
+# you wrote yourself. MetaTrader5 is Windows-only, so a live MT5 account cannot
+# run here — run forexBot on a Windows VPS and point this unit at the parts that
+# do work cross-platform (backtests, research, the alert watcher).
+#
+#   sudo cp forex-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now forex-bot
+#   journalctl -u forex-bot -f
+
+[Unit]
+Description=forex_bot supervised tick loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fxbot
+Group=fxbot
+WorkingDirectory=/opt/forex_bot
+EnvironmentFile=/etc/forex-bot.env
+ExecStart=/usr/bin/python3 /opt/forex_bot/deploy/watchdog.py --stale 300 -- main.py --mock
+Restart=always
+RestartSec=5
+# secrets never live in the unit file, only in EnvironmentFile (chmod 600)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/forex_bot
+MemoryMax=1G
+TasksMax=128
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
