@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from config import BotConfig
+from costs import CostModel
 from data_feed import MockDataFeed
 from indicators import Indicators
 from logger import get_logger
@@ -56,6 +57,11 @@ class BacktestTrade:
     risk: float
     reward: float
     confidence: float
+    gross_pnl: float = 0.0
+    cost_spread: float = 0.0
+    cost_commission: float = 0.0
+    cost_swap: float = 0.0
+    nights_held: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-safe representation."""
@@ -69,6 +75,8 @@ class Backtester:
     config: BotConfig
     strategy: AdvancedStrategy
     min_confidence: Optional[float] = None
+    #: Full cost model. When None, the legacy flat-spread charge is used.
+    costs: Optional[CostModel] = None
     trades: List[BacktestTrade] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
     drawdown_curve: List[float] = field(default_factory=list)
@@ -134,8 +142,9 @@ class Backtester:
                 if exit_price is None:
                     self._track_curve(balance, peak)
                     continue
-                gross = self._gross_pnl(pos, exit_price, pip_size)
-                pnl = round(gross - spread_cost * pos["lots"], 2)
+                fill = self._apply_exit_fill(pos, exit_price, pip_size, reason, times[i])
+                gross, breakdown = self._settle(pos, fill, pip_size, times[i], spread_cost)
+                pnl = round(gross - breakdown["cash"], 2)
                 balance = round(balance + pnl, 2)
                 peak = max(peak, balance)
                 self.trades.append(
@@ -145,7 +154,7 @@ class Backtester:
                         entry_time=str(times[pos["bar"]]),
                         exit_time=str(times[i]),
                         entry_price=round(pos["entry"], 5),
-                        exit_price=round(exit_price, 5),
+                        exit_price=round(fill, 5),
                         lots=pos["lots"],
                         pnl=pnl,
                         bars_held=i - pos["bar"],
@@ -153,6 +162,11 @@ class Backtester:
                         risk=round(pos["risk"], 5),
                         reward=round(pos["reward"], 5),
                         confidence=pos["confidence"],
+                        gross_pnl=round(gross, 2),
+                        cost_spread=breakdown["spread"],
+                        cost_commission=breakdown["commission"],
+                        cost_swap=breakdown["swap"],
+                        nights_held=int(breakdown["nights"]),
                     )
                 )
                 pos = None
@@ -173,7 +187,12 @@ class Backtester:
                 self._track_curve(balance, peak)
                 continue
 
-            entry = float(closes[i + 1])  # filled at next bar's open — no look-ahead
+            raw_entry = float(closes[i + 1])  # next bar's open — no look-ahead
+            entry = (
+                self.costs.entry_fill(raw_entry, sig.direction, pip_size, times[i + 1])
+                if self.costs is not None
+                else raw_entry
+            )
             offset = sig.price - entry
             entry_time = str(times[i + 1])
             pos = {
@@ -193,7 +212,8 @@ class Backtester:
 
         if pos is not None:
             self.log.info("Backtest ended with an open position — closed at last price (mark-to-market).")
-            pnl = round(self._gross_pnl(pos, float(closes[-1]), pip_size) - spread_cost * pos["lots"], 2)
+            gross, breakdown = self._settle(pos, float(closes[-1]), pip_size, times[-1], spread_cost)
+            pnl = round(gross - breakdown["cash"], 2)
             balance = round(balance + pnl, 2)
             self.trades.append(
                 BacktestTrade(
@@ -202,7 +222,9 @@ class Backtester:
                     exit_price=round(float(closes[-1]), 5), lots=pos["lots"], pnl=pnl,
                     bars_held=n - 1 - pos["bar"], exit_reason="end_of_data",
                     risk=round(pos["risk"], 5), reward=round(pos["reward"], 5),
-                    confidence=pos["confidence"],
+                    confidence=pos["confidence"], gross_pnl=round(gross, 2),
+                    cost_spread=breakdown["spread"], cost_commission=breakdown["commission"],
+                    cost_swap=breakdown["swap"], nights_held=int(breakdown["nights"]),
                 )
             )
             self._track_curve(balance, peak)
@@ -241,6 +263,41 @@ class Backtester:
             if low <= tp:
                 return tp, "take_profit"
         return None, ""
+
+    def _apply_exit_fill(
+        self, pos: Dict[str, Any], exit_price: float, pip_size: float, reason: str, moment: Any
+    ) -> float:
+        """Degrade the theoretical exit price by half-spread + slippage."""
+        if self.costs is None:
+            return exit_price
+        return self.costs.exit_fill(
+            exit_price, pos["direction"], pip_size, is_stop=(reason == "stop_loss"), moment=moment
+        )
+
+    def _settle(
+        self, pos: Dict[str, Any], exit_price: float, pip_size: float, exit_time: Any, legacy_spread: float
+    ) -> tuple[float, Dict[str, float]]:
+        """Return ``(gross_pnl, cost_breakdown)`` for a closing position.
+
+        With a :class:`costs.CostModel` attached, spread and slippage are
+        already baked into the fill prices, so only commission and swap are
+        deducted here as cash. Without one, the legacy flat spread charge
+        is applied so existing results stay reproducible.
+        """
+        gross = self._gross_pnl(pos, exit_price, pip_size)
+        if self.costs is None:
+            cash = legacy_spread * pos["lots"]
+            return gross, {"cash": cash, "spread": round(cash, 4), "commission": 0.0, "swap": 0.0, "nights": 0.0}
+        items = self.costs.total_cost(
+            pos["direction"], pos["lots"], pos.get("entry_time"), exit_time, pip_size
+        )
+        return gross, {
+            "cash": items["total_cash"],
+            "spread": items["spread_cost"],
+            "commission": items["commission"],
+            "swap": items["swap"],
+            "nights": items["nights"],
+        }
 
     def _gross_pnl(self, pos: Dict[str, Any], exit_price: float, pip_size: float) -> float:
         """Cash P&L before spread for an open paper position."""

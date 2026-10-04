@@ -101,6 +101,76 @@ Reported metrics: `total_trades`, `win_rate`, `total_pnl`, `total_return`,
 `avg_win`, `avg_loss`, `profit_factor`, `max_drawdown`, `sharpe_ratio`
 (annualised), `largest_win/loss`, `avg_risk_reward`, `expectancy`.
 
+## 4b. Validating the strategy (do this before risking money)
+
+A single backtest over all history answers the wrong question. These three
+modules answer the right one.
+
+### Step 1 — get real data
+
+`MockDataFeed` is a seeded random walk: no trends, no fat tails, no weekend
+gaps. A backtest against it measures the *backtester*, not the strategy.
+
+```bash
+# on Windows, terminal logged in
+python history.py --source mt5 --pair EUR/USD --timeframe 1h \
+    --start 2015-01-01 --end 2024-12-31
+
+# anywhere, from a vendor CSV (Dukascopy, HistData, broker export)
+python history.py --source csv --file ~/EURUSD_H1.csv --pair EUR/USD
+
+python history.py --list     # what is cached, with gap analysis
+```
+
+Cached to `forex_bot/data/` as Parquet (CSV fallback). Git-ignored.
+
+### Step 2 — charge realistic costs
+
+`costs.py` models what a flat "1.5 pip spread" omits:
+
+| Component | Default | Note |
+|---|---|---|
+| Spread | 1.5 pips | x2.5 during 21:00–23:00 UTC rollover |
+| Commission | $3.5/lot/side | charged both sides |
+| Slippage | 0.3p entry / **0.8p stop** | stops fill into momentum |
+| Swap | per-pair table | **tripled on Wednesday** |
+
+On a 6000-bar sample, switching costs on moved profit factor from **5.60 to
+1.51** and cut P&L by 88%. For an hourly strategy holding overnight, swap is
+frequently larger than the spread.
+
+### Step 3 — walk forward
+
+```bash
+python walkforward.py --pair EUR/USD --train 12 --test 3
+python walkforward.py --pair EUR/USD --quick      # smaller grid
+python walkforward.py --pair EUR/USD --no-costs   # diagnostic only
+```
+
+Parameters are optimised **in-sample**, frozen, then evaluated **once** on
+the untouched next block. How to read the verdict:
+
+* **OOS profit factor < 1.0** → no edge. Stop.
+* **Efficiency < 0.5** → in-sample results do not transfer; curve-fitting.
+* **Unstable parameters across folds** → fitting noise.
+* Profits only with `--no-costs` → not a strategy.
+
+Efficiency normalises both sides *per month*, so a 12-month train window and
+a 3-month test window are compared on equal footing.
+
+## 4c. Tests
+
+```bash
+pip install pytest
+python -m pytest forex_bot/tests -q      # 60 tests
+```
+
+Covers every risk gate (halt latching, UTC rollover, fail-closed sizing, the
+JPY pip-size trap), the cost model (Wednesday triple swap, adverse fills),
+and backtester integrity — including the decisive look-ahead test: trades
+taken in the first half of history must be identical whether or not the
+second half exists.
+
 ## 5. Configuration (`config.py`)
 
 Everything lives in the `BotConfig` dataclass — edit the defaults, or override

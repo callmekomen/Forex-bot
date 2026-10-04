@@ -4,3 +4,8 @@ numpy>=1.24.0
 # Telegram remote control (telegram_control.py) uses the stdlib only — urllib.
 # No extra package required. Optional: pip install python-telegram-bot if you
 # prefer its webhook plumbing over the built-in long-poller.
+
+# Development / validation only (not needed to run the bot):
+#   pytest        — test suite in forex_bot/tests
+#   pyarrow       — Parquet cache for history.py (falls back to CSV)
+# pip install pytest pyarrow

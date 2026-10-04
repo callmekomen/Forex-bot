@@ -20,3 +20,7 @@ dist/
 .idea/
 .vscode/
 bot_state_selftest_*.json
+
+# Cached market history — data belongs outside git
+forex_bot/data/
+*.parquet
