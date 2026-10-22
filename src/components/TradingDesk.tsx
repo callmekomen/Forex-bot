@@ -12,11 +12,14 @@ import {
 import { Line } from "react-chartjs-2";
 import {
   CircleStop,
+  Crosshair,
+  Dices,
   Gauge,
   Pause,
   Play,
   RotateCcw,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Trash2,
   X,
@@ -35,6 +38,17 @@ import {
   type Pair,
   type ScoreRow,
 } from "../lib/sim";
+import {
+  DEFAULT_GAMBLE_GATE,
+  GAMBLE_COOLDOWN_TICKS,
+  GAMBLE_MAX_LOSSES_PER_DAY,
+  GAMBLE_MAX_PER_DAY,
+  evaluateCandidate,
+  previewStake,
+  rMultiple,
+  rankCandidates,
+  type GambleCandidate,
+} from "../lib/gamble";
 
 ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Filler, Tooltip, BarElement);
 
@@ -53,6 +67,50 @@ interface Pos {
   tp: number;
   openedAt: string;
   openedTick: number;
+  /** Opened by the GAMBLE button (one A+ bet, capped stake). */
+  gamble?: boolean;
+  /** Stop distance at entry — R-multiples must survive a breakeven move. */
+  initialSl?: number;
+  /** Stop already moved to entry at +1R. */
+  protected?: boolean;
+}
+
+type GamblePhase =
+  | "idle" | "hunting" | "found" | "in_trade"
+  | "won" | "lost" | "closed" | "expired" | "refused" | "cancelled";
+
+interface GambleState {
+  phase: GamblePhase;
+  scans: number;
+  maxScans: number;
+  ticket: number | null;
+  candidate: GambleCandidate | null;
+  ranking: GambleCandidate[];
+  bestEdge: number;
+  reason: string;
+  stakePct: number;
+  riskUsd: number;
+  targetUsd: number;
+  foundTick: number;
+  lastPnl: number | null;
+  // ── durable daily ledger (mirrors gamble.py GambleLedger) ──
+  date: string;
+  taken: number;
+  wins: number;
+  losses: number;
+  netPnl: number;
+  cooldownUntilTick: number;
+}
+
+const todayKey = () => new Date().toISOString().slice(0, 10);
+
+function freshGamble(): GambleState {
+  return {
+    phase: "idle", scans: 0, maxScans: 90, ticket: null, candidate: null,
+    ranking: [], bestEdge: 0, reason: "", stakePct: 0.02, riskUsd: 0,
+    targetUsd: 0, foundTick: 0, lastPnl: null,
+    date: todayKey(), taken: 0, wins: 0, losses: 0, netPnl: 0, cooldownUntilTick: 0,
+  };
 }
 interface Closed extends Omit<Pos, "openedTick"> {
   exit: number;
@@ -91,6 +149,7 @@ interface Engine {
   equity: number[];
   pairs: PairState[];
   phase: number;
+  gamble: GambleState;
 }
 
 const now = () => new Date().toISOString().slice(11, 19);
@@ -117,6 +176,7 @@ function makeEngine(balance: number): Engine {
     equity: [balance],
     pairs,
     phase: 0,
+    gamble: freshGamble(),
   };
 }
 
@@ -137,6 +197,13 @@ export function TradingDesk() {
   const [ddLimit, setDdLimit] = useState(0.15);
   const [sessionFilter, setSessionFilter] = useState(false);
   const [active, setActive] = useState<Pair[]>(["EUR/USD", "GBP/USD", "USD/JPY"]);
+  // ── gamble button settings ──
+  const [gambleRiskPct, setGambleRiskPct] = useState(0.02);
+  const [gambleMinConf, setGambleMinConf] = useState(DEFAULT_GAMBLE_GATE.minConfidence);
+  const [gambleMinEdge, setGambleMinEdge] = useState(DEFAULT_GAMBLE_GATE.minEdgeScore);
+  const [gambleMaxScans, setGambleMaxScans] = useState(90);
+  const [gambleAutoTake, setGambleAutoTake] = useState(true);
+  const [gambleProtect, setGambleProtect] = useState(true);
   const [tab, setTab] = useState<"open" | "closed">("open");
   const [, force] = useState(0);
 
@@ -144,9 +211,15 @@ export function TradingDesk() {
   if (!eng.current) eng.current = makeEngine(10000);
   const e = eng.current;
 
-  const cfgRef = useRef({ riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit, sessionFilter, active });
+  const cfgRef = useRef({
+    riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit, sessionFilter, active,
+    gambleRiskPct, gambleMinConf, gambleMinEdge, gambleMaxScans, gambleAutoTake, gambleProtect,
+  });
   useEffect(() => {
-    cfgRef.current = { riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit, sessionFilter, active };
+    cfgRef.current = {
+      riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit, sessionFilter, active,
+      gambleRiskPct, gambleMinConf, gambleMinEdge, gambleMaxScans, gambleAutoTake, gambleProtect,
+    };
   });
 
   /* ── restore persisted desk state (mirrors load_state) ─────────── */
@@ -166,6 +239,22 @@ export function TradingDesk() {
       eng2.ticket = Number(s.next_ticket ?? 900_001);
       eng2.tick = Number(s.tick ?? 0);
       eng2.equity = Array.isArray(s.equity) ? s.equity.slice(-160) : [eng2.balance];
+      // gamble ledger: today's budget/lockout survives a refresh, like the halt
+      const gl = s.gamble ?? {};
+      if (gl.date === todayKey()) {
+        eng2.gamble.date = String(gl.date);
+        eng2.gamble.taken = Number(gl.taken ?? 0);
+        eng2.gamble.wins = Number(gl.wins ?? 0);
+        eng2.gamble.losses = Number(gl.losses ?? 0);
+        eng2.gamble.netPnl = Number(gl.netPnl ?? 0);
+        eng2.gamble.cooldownUntilTick = Number(gl.cooldownUntilTick ?? 0);
+        eng2.gamble.lastPnl = gl.lastPnl == null ? null : Number(gl.lastPnl);
+      }
+      const openGamble = eng2.open.find((p) => p.gamble);
+      if (openGamble) {
+        eng2.gamble.phase = "in_trade";
+        eng2.gamble.ticket = openGamble.ticket;
+      }
       log(
         eng2,
         "info",
@@ -194,12 +283,129 @@ export function TradingDesk() {
           trade_log: e.closed.slice(-50),
           equity: e.equity.slice(-160),
           next_ticket: e.ticket,
+          gamble: {
+            date: e.gamble.date, taken: e.gamble.taken, wins: e.gamble.wins,
+            losses: e.gamble.losses, netPnl: e.gamble.netPnl,
+            cooldownUntilTick: e.gamble.cooldownUntilTick, lastPnl: e.gamble.lastPnl,
+          },
         }),
       );
     } catch {
       /* ignore quota errors */
     }
   }, [e]);
+
+  /* ── gamble helpers ────────────────────────────────────────────── */
+
+  /** Reset the daily gamble ledger at 00:00 UTC (lockouts are per-day). */
+  const rollGambleDay = (eng2: Engine) => {
+    const g = eng2.gamble;
+    if (g.date !== todayKey()) {
+      g.date = todayKey();
+      g.taken = 0; g.wins = 0; g.losses = 0; g.netPnl = 0; g.cooldownUntilTick = 0;
+    }
+  };
+
+  /** Why the button is locked right now — "" when a press may proceed. */
+  const gambleLock = (eng2: Engine): string => {
+    rollGambleDay(eng2);
+    const g = eng2.gamble;
+    if (g.phase === "hunting" || g.phase === "found") return "a hunt is already running";
+    if (g.phase === "in_trade") return `gamble ticket ${g.ticket} is still open — one at a time`;
+    if (eng2.halted) return `BOT HALTED (${eng2.haltReason})`;
+    if (g.taken >= GAMBLE_MAX_PER_DAY) return `daily gamble budget spent (${g.taken}/${GAMBLE_MAX_PER_DAY}) — locked until 00:00 UTC`;
+    if (g.losses >= GAMBLE_MAX_LOSSES_PER_DAY) return `${g.losses} losing gambles today — locked until 00:00 UTC (no revenge trades)`;
+    if (eng2.tick < g.cooldownUntilTick) return `cooldown after a losing gamble — ${g.cooldownUntilTick - eng2.tick} tick(s) remaining`;
+    return "";
+  };
+
+  /** Book a finished gamble into the ledger and settle the phase. */
+  const settleGamble = (eng2: Engine, pos: Pos, pnl: number) => {
+    const g = eng2.gamble;
+    if (!pos.gamble) return;
+    g.netPnl = Math.round((g.netPnl + pnl) * 100) / 100;
+    g.lastPnl = pnl;
+    g.ticket = null;
+    // A breakeven-protected exit that scratches around zero is not a
+    // "loss" for lockout purposes — protection did its job.
+    const scratch = Boolean(pos.protected) && g.riskUsd > 0 && pnl >= -0.2 * g.riskUsd;
+    if (pnl > 0) {
+      g.wins++;
+      g.phase = "won";
+      g.reason = `gamble WON ${usd(pnl)} on ${pos.pair} — target was +${g.targetUsd.toFixed(2)}`;
+    } else if (scratch) {
+      g.phase = "closed";
+      g.reason = `gamble protected at breakeven — scratched ${usd(pnl)} on ${pos.pair}, capital intact`;
+    } else {
+      g.losses++;
+      g.phase = "lost";
+      g.cooldownUntilTick = eng2.tick + GAMBLE_COOLDOWN_TICKS;
+      g.reason = `gamble lost ${usd(pnl)} on ${pos.pair} — stake was capped, cooldown ${GAMBLE_COOLDOWN_TICKS} ticks, no revenge trade`;
+    }
+    log(eng2, pnl > 0 ? "long" : scratch ? "warn" : "short", "gamble",
+      `🎲 ${g.reason} | today ${g.taken} gambles, ${g.wins}W/${g.losses}L, net ${usd(g.netPnl)}`);
+  };
+
+  /** Open THE one gamble trade for an A+ candidate. Returns success. */
+  const executeGamble = (eng2: Engine, cand: GambleCandidate): boolean => {
+    const c = cfgRef.current;
+    const g = eng2.gamble;
+    if (eng2.open.some((x) => x.pair === cand.pair)) {
+      g.reason = `already holding a position on ${cand.pair} — gamble skipped`;
+      return false;
+    }
+    if (eng2.open.length >= c.maxOpen) {
+      g.reason = `no free slot (${eng2.open.length}/${c.maxOpen} open) — gamble skipped`;
+      return false;
+    }
+    const stake = previewStake({
+      balance: eng2.balance,
+      stakeFraction: g.stakePct,
+      dailyPnl: eng2.dailyPnl,
+      dayStartBalance: eng2.dayStart,
+      dailyLimitFraction: c.dailyLimit,
+      candidate: cand,
+    });
+    if (stake.lots <= 0) {
+      g.reason = stake.cappedByDailyBudget
+        ? `daily loss budget nearly spent (${usd(stake.dailyBudgetLeftUsd)} left) — stake rounds to zero, no bet`
+        : "stake rounds to zero lots — stop too wide for the stake, no bet";
+      log(eng2, "warn", "gamble", `🎲 REFUSED — ${g.reason}`);
+      return false;
+    }
+    // Fill 1 pip through the quoted price, shifting SL/TP by the same
+    // amount so the cash risk is exactly what the ticket promised.
+    const pip = pipSizeOf(cand.pair);
+    const fill = cand.dir === "BUY" ? cand.price + pip : cand.price - pip;
+    const shift = fill - cand.price;
+    const pos: Pos = {
+      ticket: eng2.ticket++,
+      pair: cand.pair,
+      dir: cand.dir,
+      lots: stake.lots,
+      entry: Number(fill.toFixed(5)),
+      sl: Number((cand.sl + shift).toFixed(5)),
+      tp: Number((cand.tp + shift).toFixed(5)),
+      openedAt: now(),
+      openedTick: eng2.tick,
+      gamble: true,
+      initialSl: Number((cand.sl + shift).toFixed(5)),
+      protected: false,
+    };
+    eng2.open.push(pos);
+    const p = eng2.pairs.find((x) => x.pair === cand.pair);
+    if (p) p.skip = Math.max(p.skip, 10);
+    g.taken++;
+    g.phase = "in_trade";
+    g.ticket = pos.ticket;
+    g.candidate = cand;
+    g.riskUsd = stake.riskUsd;
+    g.targetUsd = stake.targetUsd;
+    g.reason = `A+ ${cand.pair} ${cand.signal} taken — risk ${usd(stake.riskUsd)} to make +${usd(stake.targetUsd)} (RR ${cand.riskReward.toFixed(2)}, only needs a ${(cand.breakevenWinRate * 100).toFixed(0)}% win rate to break even)`;
+    log(eng2, cand.dir === "BUY" ? "long" : "short", "gamble",
+      `🎲 GAMBLE TAKEN ${pos.dir} ${pos.pair} ${pos.lots.toFixed(2)} lots @ ${pos.entry.toFixed(5)} | SL ${pos.sl.toFixed(5)} TP ${pos.tp.toFixed(5)} | edge ${cand.edgeScore.toFixed(1)} conf ${cand.confidence.toFixed(2)} | risk ${usd(stake.riskUsd)} (${(g.stakePct * 100).toFixed(2)}% stake${stake.cappedByDailyBudget ? ", clamped by daily budget" : ""}) → target +${usd(stake.targetUsd)} | ticket ${pos.ticket} | ${cand.reasons.slice(0, 2).join("; ")}`);
+    return true;
+  };
 
   /* ── the tick: manage → gate → scan → size → fill ──────────────── */
   const doTick = useCallback(() => {
@@ -235,6 +441,16 @@ export function TradingDesk() {
       const pip = pipSizeOf(pos.pair);
       const bid = p.price - p.price * 0.00006;
       const ask = p.price + p.price * 0.00006;
+      // 2a ── gamble protection: at +1R move the stop to entry, so a
+      // winning gamble can no longer become a losing one.
+      if (pos.gamble && c.gambleProtect && !pos.protected) {
+        const rNow = rMultiple(pos.entry, pos.initialSl ?? pos.sl, p.price, pos.dir);
+        if (rNow >= 1) {
+          pos.sl = pos.entry;
+          pos.protected = true;
+          log(eng2, "warn", "gamble", `🎲 +${rNow.toFixed(2)}R on ticket ${pos.ticket} — stop moved to breakeven ${pos.entry.toFixed(5)}. Worst case now ≈ scratch.`);
+        }
+      }
       const hitLong = pos.dir === "BUY" && bid <= pos.sl;
       const hitLongTp = pos.dir === "BUY" && bid >= pos.tp;
       const hitShort = pos.dir === "SELL" && ask >= pos.sl;
@@ -254,6 +470,7 @@ export function TradingDesk() {
           "risk",
           `CLOSED ${pos.dir} ${pos.pair} ticket ${pos.ticket} -> ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD (${hitLong || hitShort ? "stop_loss" : "take_profit"}) | day ${eng2.dailyPnl >= 0 ? "+" : ""}${eng2.dailyPnl.toFixed(2)} | balance ${eng2.balance.toFixed(2)}`,
         );
+        settleGamble(eng2, pos, pnl);
       }
     }
 
@@ -274,6 +491,74 @@ export function TradingDesk() {
     if (eng2.equity.length > 160) eng2.equity.shift();
     if (eng2.closed.length > 120) eng2.closed.length = 120;
 
+    // 3b ── GAMBLE hunt: rank everything, take at most ONE A+ bet.
+    // Runs before the normal scan and pauses new normal entries while
+    // active — the gamble gets first (and only) claim on the setup.
+    const g = eng2.gamble;
+    rollGambleDay(eng2);
+    if (g.phase === "found" && eng2.tick - g.foundTick > 20) {
+      g.phase = "hunting";
+      g.reason = "the A+ setup you were shown went stale (20 ticks) — hunting again";
+      log(eng2, "warn", "gamble", "🎲 A+ setup expired unconfirmed — resuming the hunt.");
+    }
+    if (g.phase === "hunting") {
+      if (eng2.halted) {
+        g.phase = "refused";
+        g.reason = `BOT HALTED (${eng2.haltReason}) — hunt aborted, no bet`;
+        log(eng2, "error", "gamble", `🎲 HUNT ABORTED — ${g.reason}`);
+      } else if (!inHours) {
+        g.phase = "refused";
+        g.reason = `outside trading hours (${String(utcHour).padStart(2, "0")}:00 UTC) — no bet`;
+        log(eng2, "warn", "gamble", `🎲 HUNT ABORTED — ${g.reason}`);
+      } else {
+        g.scans++;
+        const gate = {
+          minConfidence: c.gambleMinConf,
+          minRiskReward: Math.max(1.8, 1.5),
+          minAdx: DEFAULT_GAMBLE_GATE.minAdx,
+          minEdgeScore: c.gambleMinEdge,
+        };
+        const rows: Array<{ pair: string; row: ScoreRow }> = [];
+        for (const p of eng2.pairs) {
+          if (!c.active.includes(p.pair)) continue;
+          const d = prepare(p.candles, params);
+          const row = scoreAt(d, p.candles.length - 1, params);
+          p.row = row;
+          rows.push({ pair: p.pair, row });
+        }
+        const ranking = rankCandidates(rows, gate);
+        g.ranking = ranking;
+        g.bestEdge = Math.max(g.bestEdge, ranking[0]?.edgeScore ?? 0);
+        const takeable = ranking.find((cand) => cand.isAPlus && !eng2.open.some((x) => x.pair === cand.pair));
+        if (takeable) {
+          if (!c.gambleAutoTake) {
+            g.phase = "found";
+            g.candidate = takeable;
+            g.foundTick = eng2.tick;
+            g.reason = `A+ FOUND: ${takeable.pair} ${takeable.signal} (edge ${takeable.edgeScore.toFixed(1)}) — confirm within 20 ticks to take it`;
+            log(eng2, "warn", "gamble", `🎲 ${g.reason}`);
+          } else if (!executeGamble(eng2, takeable)) {
+            g.phase = "refused";
+            log(eng2, "warn", "gamble", `🎲 REFUSED at execution — ${g.reason}`);
+          }
+        } else if (g.scans >= g.maxScans) {
+          g.phase = "expired";
+          const top = ranking[0];
+          g.reason = top
+            ? `hunted ${g.maxScans} scans, no A+ setup — best was ${top.pair} edge ${top.edgeScore.toFixed(1)} (${top.failed.join("; ")}). No bet placed. That refusal IS the edge.`
+            : `hunted ${g.maxScans} scans with nothing to rank — no bet placed`;
+          log(eng2, "warn", "gamble", `🎲 HUNT EXPIRED — ${g.reason}`);
+        } else if (g.scans % 10 === 1) {
+          const top = ranking[0];
+          if (top) {
+            log(eng2, "info", "gamble",
+              `🎲 hunting ${g.scans}/${g.maxScans} — best so far ${top.pair} ${top.signal} edge ${top.edgeScore.toFixed(1)} (best-ever ${g.bestEdge.toFixed(1)}), needs ≥ ${gate.minEdgeScore} + conf ≥ ${gate.minConfidence.toFixed(2)}`);
+          }
+        }
+      }
+    }
+    const gambleActive = g.phase === "hunting" || g.phase === "found" || g.phase === "in_trade";
+
     // 4 ── can_trade()
     const gateFail = eng2.halted
       ? `BOT HALTED (${eng2.haltReason})`
@@ -284,6 +569,10 @@ export function TradingDesk() {
           : "";
     if (gateFail) {
       if (eng2.tick % 5 === 1) log(eng2, "warn", "bot", `No analysis this tick — ${gateFail}`);
+    } else if (gambleActive) {
+      if (eng2.tick % 10 === 1) {
+        log(eng2, "info", "gamble", "🎲 gamble focus — new normal entries paused until the gamble settles (open positions still managed)");
+      }
     } else {
       // 5 ── scan each enabled pair
       for (const p of eng2.pairs) {
@@ -383,9 +672,103 @@ export function TradingDesk() {
     e.balance = Math.round((e.balance + pnl) * 100) / 100;
     e.peak = Math.max(e.peak, e.balance);
     log(e, pnl >= 0 ? "long" : "short", "bot", `Manual close ticket ${ticket} ${pos.pair} → ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD`);
+    settleGamble(e, pos, pnl);
     persist();
     force((v) => v + 1);
   };
+  /* ── THE GAMBLE BUTTON ─────────────────────────────────────────── */
+  const startGamble = useCallback((): string => {
+    const eng2 = eng.current!;
+    const c = cfgRef.current;
+    const g = eng2.gamble;
+    if (!c.active.length) {
+      log(eng2, "error", "gamble", "🎲 No pairs selected — nothing to hunt.");
+      force((v) => v + 1);
+      return "no pairs selected";
+    }
+    const locked = gambleLock(eng2);
+    if (locked) {
+      g.phase = g.phase === "in_trade" ? g.phase : "refused";
+      g.reason = locked;
+      log(eng2, "warn", "gamble", `🎲 GAMBLE LOCKED — ${locked}`);
+      force((v) => v + 1);
+      return locked;
+    }
+    if (eng2.open.length >= c.maxOpen) {
+      g.phase = "refused";
+      g.reason = `all ${c.maxOpen} position slots are full — close something first`;
+      log(eng2, "warn", "gamble", `🎲 REFUSED — ${g.reason}`);
+      force((v) => v + 1);
+      return g.reason;
+    }
+    g.phase = "hunting";
+    g.scans = 0;
+    g.maxScans = c.gambleMaxScans;
+    g.stakePct = c.gambleRiskPct;
+    g.bestEdge = 0;
+    g.candidate = null;
+    g.ticket = null;
+    g.riskUsd = 0;
+    g.targetUsd = 0;
+    g.reason = `hunting one A+ setup across ${c.active.length} pair(s) — stake ${(c.gambleRiskPct * 100).toFixed(2)}% ≈ ${usd(eng2.balance * c.gambleRiskPct)} max loss, up to ${c.gambleMaxScans} scans`;
+    log(eng2, "warn", "gamble",
+      `🎲 GAMBLE PRESSED — hunting ONE A+ setup (edge ≥ ${c.gambleMinEdge}, conf ≥ ${c.gambleMinConf.toFixed(2)}, RR ≥ 1.80, ADX ≥ 20). Stake ${(c.gambleRiskPct * 100).toFixed(2)}% ≈ ${usd(eng2.balance * c.gambleRiskPct)} max loss. ${c.gambleAutoTake ? "Will auto-take the first A+." : "Will ask you to confirm."} No A+ in ${c.gambleMaxScans} scans = no bet.`);
+    if (!running) {
+      log(eng2, "info", "gamble", "🎲 loop was idle — starting it so the hunt can scan live ticks.");
+      setRunning(true);
+    }
+    persist();
+    force((v) => v + 1);
+    return "hunting";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, persist]);
+
+  const stopGamble = useCallback((): string => {
+    const eng2 = eng.current!;
+    const g = eng2.gamble;
+    if (g.phase === "hunting" || g.phase === "found") {
+      g.phase = "cancelled";
+      g.reason = `hunt cancelled after ${g.scans} scan(s) — no bet was placed`;
+      log(eng2, "warn", "gamble", `🎲 ${g.reason}`);
+      persist();
+      force((v) => v + 1);
+      return "hunt cancelled — no bet was placed";
+    }
+    if (g.phase === "in_trade") {
+      return "the gamble is already in a trade — it keeps its SL/TP. Use close on the ticket to exit now.";
+    }
+    return "no gamble hunt is running";
+  }, [persist]);
+
+  const confirmGamble = useCallback((): string => {
+    const eng2 = eng.current!;
+    const c = cfgRef.current;
+    const g = eng2.gamble;
+    if (g.phase !== "found" || !g.candidate) return "nothing is waiting for confirmation";
+    // Re-score the pair right now: only take it if it is *still* A+.
+    const p = eng2.pairs.find((x) => x.pair === g.candidate!.pair)!;
+    const params = { ...DEFAULT_PARAMS, atrMult: c.atrMult, tpMult: c.tpMult, minConfidence: c.minConf };
+    const row = scoreAt(prepare(p.candles, params), p.candles.length - 1, params);
+    p.row = row;
+    const fresh = evaluateCandidate(p.pair, row, {
+      minConfidence: c.gambleMinConf, minRiskReward: 1.8,
+      minAdx: DEFAULT_GAMBLE_GATE.minAdx, minEdgeScore: c.gambleMinEdge,
+    });
+    if (!fresh.isAPlus) {
+      g.phase = "hunting";
+      g.reason = `setup faded before you confirmed (${fresh.failed.join("; ")}) — hunting again`;
+      log(eng2, "warn", "gamble", `🎲 ${g.reason}`);
+      force((v) => v + 1);
+      return g.reason;
+    }
+    const ok = executeGamble(eng2, fresh);
+    if (!ok) g.phase = "refused";
+    persist();
+    force((v) => v + 1);
+    return ok ? `gamble taken on ${fresh.pair}` : g.reason;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persist]);
+
   const clearHalt = () => {
     e.halted = false;
     e.haltReason = "";
@@ -458,8 +841,31 @@ export function TradingDesk() {
           ].join("\n");
         case "/pairs":
           return `📌 watching: ${active.join(", ")}  [1h]`;
+        case "/gamble": {
+          const g2 = eng2.gamble;
+          const sub = (parts[1] || "").toLowerCase();
+          if (sub === "stop") return `🎲 ${stopGamble()}`;
+          if (sub === "status" || sub === "") {
+            const locked = gambleLock(eng2);
+            return [
+              `🎲 gamble: ${g2.phase}${g2.phase === "hunting" ? ` (scan ${g2.scans}/${g2.maxScans}, best edge ${g2.bestEdge.toFixed(1)})` : ""}`,
+              g2.phase === "in_trade"
+                ? `🎯 ticket ${g2.ticket} ${g2.candidate?.pair ?? ""} risk ${usd(g2.riskUsd)} → target +${usd(g2.targetUsd)}`
+                : g2.reason || "idle — /gamble go to hunt one A+ setup",
+              `📅 today ${g2.taken}/${GAMBLE_MAX_PER_DAY} gambles · ${g2.wins}W/${g2.losses}L · net ${usd(g2.netPnl)}`,
+              locked ? `🔒 locked: ${locked}` : "🔓 button available",
+            ].join("\n");
+          }
+          if (sub === "go" || sub === "start") {
+            const res = startGamble();
+            return res === "hunting"
+              ? `🎲 HUNTING — one A+ setup, stake ${(gambleRiskPct * 100).toFixed(2)}% (≈${usd(eng2.balance * gambleRiskPct)} max loss). No A+ = no bet.`
+              : `🎲 refused: ${res}`;
+          }
+          return "🎲 usage: /gamble · /gamble go · /gamble stop";
+        }
         default:
-          return "Unknown command. /start /stop /status /positions /close <ticket|all> /halt /resume /risk /tick /help";
+          return "Unknown command. /start /stop /status /positions /close <ticket|all> /halt /resume /risk /tick /gamble /help";
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -480,6 +886,10 @@ export function TradingDesk() {
       closedCount: e.closed.length,
       wins: e.closed.filter((t) => t.pnl > 0).length,
       pairs: [...active],
+      gamble: {
+        phase: e.gamble.phase, taken: e.gamble.taken, wins: e.gamble.wins,
+        losses: e.gamble.losses, netPnl: e.gamble.netPnl, ticket: e.gamble.ticket,
+      },
       limits: { riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit },
     }),
     [running, e, active, riskPct, minConf, atrMult, tpMult, maxOpen, dailyLimit, ddLimit],
@@ -499,6 +909,57 @@ export function TradingDesk() {
     const pip = pipSizeOf(p.pair);
     return Math.round(((p.price - pos.entry) / pip) * 10 * pos.lots * (pos.dir === "BUY" ? 1 : -1) * 100) / 100;
   };
+
+  /* ── gamble view-model ─────────────────────────────────────────── */
+  const g = e.gamble;
+  const gambleGate = {
+    minConfidence: gambleMinConf,
+    minRiskReward: 1.8,
+    minAdx: DEFAULT_GAMBLE_GATE.minAdx,
+    minEdgeScore: gambleMinEdge,
+  };
+  const liveRanking: GambleCandidate[] =
+    g.ranking.length > 0
+      ? g.ranking
+      : rankCandidates(
+          scanRows.filter((p) => p.row).map((p) => ({ pair: p.pair, row: p.row! })),
+          gambleGate,
+        );
+  const bestCand = liveRanking[0] ?? null;
+  const displayCand = g.candidate ?? (bestCand?.isAPlus ? bestCand : null);
+  const stakePreview = displayCand
+    ? previewStake({
+        balance: e.balance, stakeFraction: gambleRiskPct, dailyPnl: e.dailyPnl,
+        dayStartBalance: e.dayStart, dailyLimitFraction: dailyLimit, candidate: displayCand,
+      })
+    : null;
+  const gamblePos = e.open.find((p) => p.gamble) ?? null;
+  const gamblePairState = gamblePos ? e.pairs.find((p) => p.pair === gamblePos.pair) : null;
+  const gambleR =
+    gamblePos && gamblePairState
+      ? rMultiple(gamblePos.entry, gamblePos.initialSl ?? gamblePos.sl, gamblePairState.price, gamblePos.dir)
+      : 0;
+  const gambleProgress =
+    gamblePos && gamblePairState
+      ? Math.max(0, Math.min(1,
+          gamblePos.dir === "BUY"
+            ? (gamblePairState.price - (gamblePos.initialSl ?? gamblePos.sl)) / (gamblePos.tp - (gamblePos.initialSl ?? gamblePos.sl) || 1)
+            : ((gamblePos.initialSl ?? gamblePos.sl) - gamblePairState.price) / ((gamblePos.initialSl ?? gamblePos.sl) - gamblePos.tp || 1),
+        ))
+      : 0;
+  const gambleLockReason = gambleLock(e);
+  const phaseChip: { label: string; tone: "line" | "jade" | "amber" | "rose" | "sky" } = {
+    idle: { label: "ready", tone: "line" as const },
+    hunting: { label: `hunting ${g.scans}/${g.maxScans}`, tone: "amber" as const },
+    found: { label: "A+ found — confirm", tone: "jade" as const },
+    in_trade: { label: "gamble live", tone: "jade" as const },
+    won: { label: "won", tone: "jade" as const },
+    lost: { label: "lost — cooldown", tone: "rose" as const },
+    closed: { label: "protected scratch", tone: "sky" as const },
+    expired: { label: "expired — no bet", tone: "amber" as const },
+    refused: { label: "refused", tone: "rose" as const },
+    cancelled: { label: "cancelled", tone: "line" as const },
+  }[g.phase];
 
   const chartData = {
     labels: e.equity.map((_, i) => String(i)),
@@ -616,6 +1077,233 @@ export function TradingDesk() {
           </button>
         </div>
       )}
+
+      {/* ── 🎲 GAMBLE MODE ─────────────────────────────────────────── */}
+      <Reveal>
+        <div className="panel relative mb-4 overflow-hidden rounded-xl !border-amber/35">
+          <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-amber/70 to-transparent" />
+          <div className="flex flex-wrap items-center gap-2.5 border-b border-line px-4 py-3">
+            <Dices size={16} className="text-amber" />
+            <span className="font-mono text-[11px] font-bold tracking-[0.22em] text-amber uppercase">gamble mode</span>
+            <span className="font-mono text-[10.5px] text-muted">one A+ bet · capped stake · no A+ = no bet</span>
+            <span className="ml-auto flex flex-wrap items-center gap-1.5">
+              <Chip tone={phaseChip.tone}>{phaseChip.label}</Chip>
+              <Chip tone="line">today {g.taken}/{GAMBLE_MAX_PER_DAY}</Chip>
+              <Chip tone={g.netPnl >= 0 ? "jade" : "rose"}>net {usd(g.netPnl)}</Chip>
+            </span>
+          </div>
+
+          <div className="grid gap-0 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
+            {/* stake + THE button */}
+            <div className="space-y-4 border-b border-line p-4 lg:border-r lg:border-b-0">
+              {g.phase === "found" ? (
+                <button
+                  onClick={() => confirmGamble()}
+                  className="w-full rounded-xl border border-jade bg-jade px-5 py-4 font-mono text-[15px] font-black tracking-[0.18em] text-ink uppercase transition-all hover:shadow-[0_0_38px_-8px_rgba(47,211,154,0.85)]"
+                >
+                  ★ take the A+ bet
+                </button>
+              ) : g.phase === "hunting" ? (
+                <button
+                  onClick={() => stopGamble()}
+                  className="relative w-full overflow-hidden rounded-xl border border-amber/60 bg-amber/15 px-5 py-4 font-mono text-[15px] font-black tracking-[0.18em] text-amber uppercase transition-all hover:bg-amber/25"
+                >
+                  <span className="absolute inset-0 -z-0 animate-pulse-soft bg-amber/10" />
+                  <span className="relative">◉ hunting… {g.scans}/{g.maxScans} — stop</span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => startGamble()}
+                  disabled={g.phase === "in_trade"}
+                  title={gambleLockReason || "Hunt one A+ setup and take it at your stake"}
+                  className={cx(
+                    "group w-full rounded-xl border px-5 py-4 font-mono text-[17px] font-black tracking-[0.22em] uppercase transition-all",
+                    g.phase === "in_trade"
+                      ? "cursor-not-allowed border-jade/40 bg-jade/10 text-jade"
+                      : gambleLockReason
+                        ? "border-rose/45 bg-rose/10 text-rose hover:bg-rose/15"
+                        : "border-amber bg-amber text-ink hover:shadow-[0_0_42px_-8px_rgba(247,178,59,0.9)]",
+                  )}
+                >
+                  {g.phase === "in_trade" ? `🎯 live · ticket ${g.ticket}` : gambleLockReason ? "🔒 gamble" : "🎲 gamble"}
+                </button>
+              )}
+              {g.phase === "found" && (
+                <button onClick={() => stopGamble()} className="w-full rounded-md border border-line px-3 py-2 font-mono text-[11px] text-muted uppercase hover:text-sand-2">
+                  pass — keep hunting rules, cancel
+                </button>
+              )}
+              <div className="tabnum text-center font-mono text-[11px] leading-relaxed text-muted">
+                max loss <span className="text-rose">{usd(e.balance * gambleRiskPct)}</span>
+                {"  →  "}target <span className="text-jade">+{usd(e.balance * gambleRiskPct * (tpMult / atrMult))}</span>
+                <br />at RR {(tpMult / atrMult).toFixed(2)} you break even winning just{" "}
+                {(100 / (1 + tpMult / atrMult)).toFixed(0)}% of bets
+              </div>
+              {g.phase === "hunting" && (
+                <div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-line">
+                    <div className="h-full rounded-full bg-amber transition-all duration-300" style={{ width: `${Math.min(100, (g.scans / Math.max(g.maxScans, 1)) * 100)}%` }} />
+                  </div>
+                  <div className="mt-1.5 flex justify-between font-mono text-[9.5px] text-muted">
+                    <span>scan {g.scans}/{g.maxScans}</span>
+                    <span>best edge {g.bestEdge.toFixed(1)} / needs {gambleMinEdge}+</span>
+                  </div>
+                </div>
+              )}
+              <div className="space-y-3.5 border-t border-line-soft pt-3">
+                <Slider label="stake (max loss)" value={gambleRiskPct} min={0.005} max={0.05} step={0.0025} onChange={setGambleRiskPct} display={`${(gambleRiskPct * 100).toFixed(2)}%`} tone="amber" />
+                <Slider label="A+ min confidence" value={gambleMinConf} min={0.55} max={0.85} step={0.01} onChange={setGambleMinConf} tone="sky" />
+                <Slider label="A+ min edge score" value={gambleMinEdge} min={50} max={85} step={1} onChange={setGambleMinEdge} tone="amber" />
+                <Slider label="hunt budget (scans)" value={gambleMaxScans} min={10} max={240} step={10} onChange={setGambleMaxScans} tone="rose" />
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  onClick={() => setGambleAutoTake((v) => !v)}
+                  title="Auto: take the first A+ instantly. Off: pause and ask you to confirm."
+                  className={cx("rounded-md border px-2 py-2 font-mono text-[10px] transition-colors", gambleAutoTake ? "border-amber/45 bg-amber/10 text-amber" : "border-line text-muted hover:text-sand-2")}
+                >
+                  {gambleAutoTake ? "⚡ auto-take ON" : "✋ confirm first"}
+                </button>
+                <button
+                  onClick={() => setGambleProtect((v) => !v)}
+                  title="At +1R profit, move the stop to entry so the bet cannot turn into a loss."
+                  className={cx("rounded-md border px-2 py-2 font-mono text-[10px] transition-colors", gambleProtect ? "border-jade/45 bg-jade/10 text-jade" : "border-line text-muted hover:text-sand-2")}
+                >
+                  {gambleProtect ? "🛡 breakeven @+1R" : "breakeven OFF"}
+                </button>
+              </div>
+            </div>
+
+            {/* live edge ranking */}
+            <div className="border-b border-line lg:border-b-0">
+              <div className="flex items-center gap-2 px-4 pt-3 pb-2">
+                <Crosshair size={12} className="text-amber" />
+                <span className="font-mono text-[10px] tracking-[0.18em] text-muted uppercase">edge ranking — what the button sees</span>
+              </div>
+              <div className="divide-y divide-line-soft">
+                {liveRanking.length === 0 && (
+                  <div className="px-4 py-8 text-center font-mono text-[11px] text-muted">press 🎲 GAMBLE (or start the loop) — pairs get ranked here every tick</div>
+                )}
+                {liveRanking.map((cand) => (
+                  <div key={cand.pair} className={cx("px-4 py-2.5", cand.isAPlus && "bg-jade/[0.06]")} title={cand.failed.length ? `refused: ${cand.failed.join("; ")}` : cand.passed.join("; ")}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="w-16 font-mono text-[12px] text-sand">{cand.pair}</span>
+                      <SignalBadge signal={cand.signal} size="sm" />
+                      <span className={cx("rounded border px-1.5 py-0.5 font-mono text-[10px] font-bold", cand.grade === "A+" ? "border-jade/50 bg-jade/15 text-jade" : cand.grade === "A" ? "border-sky/40 text-sky" : cand.grade === "B" ? "border-line text-sand-2" : "border-line text-muted")}>
+                        {cand.grade}
+                      </span>
+                      <span className="tabnum ml-auto font-mono text-[10.5px] text-muted">
+                        conf {cand.confidence.toFixed(2)} · ADX {cand.adx.toFixed(0)} · RR {cand.riskReward.toFixed(2)} · BE {(cand.breakevenWinRate * 100).toFixed(0)}%
+                      </span>
+                      <span className={cx("tabnum w-14 text-right font-mono text-[12px] font-bold", cand.isAPlus ? "text-jade" : "text-sand-2")}>{cand.edgeScore.toFixed(1)}</span>
+                    </div>
+                    <div className="mt-1.5 flex h-1.5 gap-0.5 overflow-hidden rounded-full">
+                      <div className="bg-sky/70" style={{ width: `${cand.breakdown.confidence}%` }} title={`confidence ${cand.breakdown.confidence}`} />
+                      <div className="bg-lilac/70" style={{ width: `${cand.breakdown.score}%` }} title={`signal strength ${cand.breakdown.score}`} />
+                      <div className="bg-amber/70" style={{ width: `${cand.breakdown.adx}%` }} title={`trend ADX ${cand.breakdown.adx}`} />
+                      <div className="bg-jade/70" style={{ width: `${cand.breakdown.riskReward}%` }} title={`risk:reward ${cand.breakdown.riskReward}`} />
+                      <div className="flex-1 bg-line/60" />
+                    </div>
+                    {cand.failed.length > 0 ? (
+                      <div className="mt-1 truncate font-mono text-[9.5px] text-rose/75">✗ {cand.failed.join(" · ")}</div>
+                    ) : (
+                      <div className="mt-1 font-mono text-[9.5px] text-jade">★ A+ — this is bettable at your stake</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="px-4 py-2 font-mono text-[9.5px] text-muted">edge = confidence ⟨sky⟩ + signal ⟨lilac⟩ + trend ⟨amber⟩ + risk:reward ⟨jade⟩ · max 100 · A+ needs every gate green</div>
+            </div>
+
+            {/* ticket / live trade / ledger */}
+            <div className="space-y-3 p-4 lg:border-l lg:border-line">
+              {gamblePos ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] tracking-[0.18em] text-muted uppercase">🎯 gamble live</span>
+                    {gamblePos.protected && <span className="inline-flex items-center gap-1 rounded border border-jade/45 bg-jade/10 px-1.5 py-0.5 font-mono text-[9.5px] text-jade"><ShieldCheck size={10} /> breakeven</span>}
+                    <span className="ml-auto font-mono text-[10px] text-muted">#{gamblePos.ticket}</span>
+                  </div>
+                  <div className="font-mono text-[13px] text-sand">
+                    <span className={gamblePos.dir === "BUY" ? "text-jade" : "text-rose"}>{gamblePos.dir === "BUY" ? "▲" : "▼"} {gamblePos.dir}</span>{" "}
+                    {gamblePos.pair} · {gamblePos.lots.toFixed(2)} lots
+                  </div>
+                  <div className="tabnum grid grid-cols-3 gap-1.5 font-mono text-[10.5px]">
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-muted">entry</span><br />{gamblePos.entry.toFixed(5)}</div>
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-rose/80">stop</span><br />{gamblePos.sl.toFixed(5)}</div>
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-jade/80">target</span><br />{gamblePos.tp.toFixed(5)}</div>
+                  </div>
+                  <div>
+                    <div className="relative h-2 rounded-full bg-gradient-to-r from-rose/50 via-panel-2 to-jade/50">
+                      <div className="absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-ink bg-sand" style={{ left: `${gambleProgress * 100}%` }} />
+                    </div>
+                    <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted"><span>-1R stop</span><span>entry</span><span>+{(tpMult / atrMult).toFixed(1)}R target</span></div>
+                  </div>
+                  <div className="tabnum flex items-baseline justify-between font-mono">
+                    <span className={cx("text-[15px] font-bold", gambleR >= 0 ? "text-jade" : "text-rose")}>{gambleR >= 0 ? "+" : ""}{gambleR.toFixed(2)}R</span>
+                    <span className="text-[11px] text-muted">risk {usd(g.riskUsd)} → +{usd(g.targetUsd)}</span>
+                  </div>
+                  <button onClick={() => closeManually(gamblePos.ticket)} className="w-full rounded-md border border-rose/45 px-3 py-2 font-mono text-[11px] text-rose uppercase transition-colors hover:bg-rose/10">
+                    cash out now (manual close)
+                  </button>
+                </>
+              ) : displayCand && stakePreview ? (
+                <>
+                  <div className="font-mono text-[10px] tracking-[0.18em] text-muted uppercase">🎫 {g.phase === "found" ? "your ticket — confirm to take it" : "next A+ ticket preview"}</div>
+                  <div className="font-mono text-[13px] text-sand">
+                    <span className={displayCand.dir === "BUY" ? "text-jade" : "text-rose"}>{displayCand.dir === "BUY" ? "▲" : "▼"} {displayCand.dir}</span>{" "}
+                    {displayCand.pair} · {stakePreview.lots.toFixed(2)} lots · edge {displayCand.edgeScore.toFixed(1)}
+                  </div>
+                  <div className="tabnum grid grid-cols-2 gap-1.5 font-mono text-[10.5px]">
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-rose/80">you risk</span><br />{usd(stakePreview.riskUsd)} ({stakePreview.stopPips} pips)</div>
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-jade/80">to make</span><br />+{usd(stakePreview.targetUsd)}</div>
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-muted">entry / stop</span><br />{displayCand.price.toFixed(5)} / {displayCand.sl.toFixed(5)}</div>
+                    <div className="rounded bg-ink-2/70 px-2 py-1.5"><span className="text-muted">target · BE win rate</span><br />{displayCand.tp.toFixed(5)} · {(displayCand.breakevenWinRate * 100).toFixed(0)}%</div>
+                  </div>
+                  {stakePreview.cappedByDailyBudget && (
+                    <div className="rounded border border-amber/40 bg-amber/10 px-2 py-1.5 font-mono text-[10px] text-amber">stake clamped by today's remaining loss budget ({usd(stakePreview.dailyBudgetLeftUsd)} left)</div>
+                  )}
+                  <div className="font-mono text-[10px] leading-relaxed text-muted">{displayCand.reasons.slice(0, 3).join(" · ")}</div>
+                </>
+              ) : (
+                <>
+                  <div className="font-mono text-[10px] tracking-[0.18em] text-muted uppercase">🎫 no ticket yet</div>
+                  <p className="font-mono text-[11px] leading-relaxed text-sand-2/80">
+                    {g.reason || "Press GAMBLE and it scans every pair each tick. The first setup that clears every A+ gate gets taken — exactly one trade, stop and target attached."}
+                  </p>
+                  {bestCand && !bestCand.isAPlus && (
+                    <p className="font-mono text-[10.5px] leading-relaxed text-rose/80">closest right now: {bestCand.pair} edge {bestCand.edgeScore.toFixed(1)} — {bestCand.failed[0]}</p>
+                  )}
+                </>
+              )}
+              <div className="space-y-1.5 border-t border-line-soft pt-3">
+                <div className="flex justify-between font-mono text-[10px] text-muted">
+                  <span>today's gamble budget</span>
+                  <span>{g.taken}/{GAMBLE_MAX_PER_DAY} used · {g.wins}W/{g.losses}L · net {usd(g.netPnl)}</span>
+                </div>
+                <div className="flex gap-1">
+                  {Array.from({ length: GAMBLE_MAX_PER_DAY }).map((_, i) => (
+                    <div key={i} className={cx("h-1.5 flex-1 rounded-full", i < g.taken ? "bg-amber" : "bg-line")} />
+                  ))}
+                </div>
+                {gambleLockReason && g.phase !== "hunting" && g.phase !== "in_trade" && (
+                  <div className="font-mono text-[10px] leading-relaxed text-rose/85">🔒 {gambleLockReason}</div>
+                )}
+                <div className="font-mono text-[9.5px] leading-relaxed text-muted">
+                  guardrails: stake ≤5% · ≤ remaining daily budget · {GAMBLE_MAX_PER_DAY}/day · locks after {GAMBLE_MAX_LOSSES_PER_DAY} losses · {GAMBLE_COOLDOWN_TICKS}-tick cooldown · zero martingale
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-line px-4 py-2.5 font-mono text-[10.5px] leading-relaxed text-muted">
+            <span className="text-amber">Honest print:</span> this is not a coin flip and <span className="text-rose">never a profit guarantee</span> — it only
+            bets when five indicators, trend strength and 1:2 geometry line up together, at a loss you chose in advance. Most presses on a dead
+            market will correctly end with <span className="text-sand-2">"no A+ — no bet"</span>. Python twin:{" "}
+            <code className="text-sky">python gamble.py --mock</code> · real bot: <code className="text-sky">POST /api/gamble</code> · Telegram: <code className="text-sky">/gamble go</code>
+          </div>
+        </div>
+      </Reveal>
 
       <div className="grid gap-4 xl:grid-cols-[290px_minmax(0,1fr)_330px]">
         {/* ── controls ─────────────────────────────────────────────── */}
@@ -797,9 +1485,9 @@ export function TradingDesk() {
                       e.open.map((pos) => {
                         const u = mark(e.pairs.find((x) => x.pair === pos.pair)!);
                         return (
-                          <tr key={pos.ticket} className="border-b border-line-soft/60 hover:bg-panel-2/50">
+                          <tr key={pos.ticket} className={cx("border-b border-line-soft/60 hover:bg-panel-2/50", pos.gamble && "bg-amber/[0.05]")}>
                             <td className="px-3 py-1.5 text-muted">{pos.ticket}</td>
-                            <td className="px-3 py-1.5 text-sand-2">{pos.pair}</td>
+                            <td className="px-3 py-1.5 text-sand-2">{pos.pair}{pos.gamble && <span title={pos.protected ? "gamble — stop at breakeven" : "gamble trade"}> 🎲{pos.protected ? "🛡" : ""}</span>}</td>
                             <td className={cx("px-3 py-1.5", pos.dir === "BUY" ? "text-jade" : "text-rose")}>
                               {pos.dir === "BUY" ? "▲" : "▼"} {pos.dir}
                             </td>
@@ -821,9 +1509,9 @@ export function TradingDesk() {
                       })}
                     {tab === "closed" &&
                       e.closed.map((t) => (
-                        <tr key={`${t.ticket}-${t.closedAt}`} className="border-b border-line-soft/60 hover:bg-panel-2/50">
+                        <tr key={`${t.ticket}-${t.closedAt}`} className={cx("border-b border-line-soft/60 hover:bg-panel-2/50", t.gamble && "bg-amber/[0.05]")}>
                           <td className="px-3 py-1.5 text-muted">{t.ticket}</td>
-                          <td className="px-3 py-1.5 text-sand-2">{t.pair}</td>
+                          <td className="px-3 py-1.5 text-sand-2">{t.pair}{t.gamble && <span title="gamble trade"> 🎲</span>}</td>
                           <td className={cx("px-3 py-1.5", t.dir === "BUY" ? "text-jade" : "text-rose")}>
                             {t.dir === "BUY" ? "▲" : "▼"}
                           </td>

@@ -57,6 +57,25 @@ class BotConfig:
     min_confidence: float = 0.6
     min_bars: int = 50                    # refuse to analyse thin histories
 
+    # ── Gamble mode (one high-conviction speculation, still gated) ───
+    #: Hard ceiling for a single gamble. The normal loop still uses
+    #: ``max_risk_per_trade``; only an explicit gamble may ask for more,
+    #: and never more than this. 5% means 20 losses in a row to zero —
+    #: the daily/drawdown halts will (and should) stop you long before.
+    gamble_max_risk_per_trade: float = 0.05
+    #: A gamble must clear a *stricter combined* bar than a normal trade:
+    #: the same confidence floor PLUS ADX, RR and edge-score floors a
+    #: normal trade never faces. At ADX≥25, confidence 0.60 means a raw
+    #: score ≥3.0 — i.e. a STRONG_BUY / STRONG_SELL sized confluence.
+    gamble_min_confidence: float = 0.60
+    gamble_min_risk_reward: float = 1.8
+    gamble_min_adx: float = 20.0
+    gamble_min_edge_score: float = 60.0   # 0-100 composite, see gamble.py
+    gamble_max_per_day: int = 3           # taken gambles per UTC day
+    gamble_max_losses_per_day: int = 2    # then the button locks until tomorrow
+    gamble_cooldown_minutes: int = 30     # forced pause after a losing gamble
+    gamble_breakeven_r: float = 1.0       # move SL to entry at +1R
+
     # ── Schedule ──────────────────────────────────────────────────────
     timeframe: str = "1h"
     tick_interval: int = 60               # seconds between analysis passes
@@ -137,6 +156,18 @@ class BotConfig:
             raise ValueError("start_hour / end_hour must be valid UTC hours (0-23)")
         if self.account_balance <= 0:
             raise ValueError("account_balance must be positive")
+        if not 0.0 < self.gamble_max_risk_per_trade <= 0.05:
+            raise ValueError("gamble_max_risk_per_trade must be in (0, 0.05] — a gamble may never risk more than 5%")
+        if not self.min_confidence <= self.gamble_min_confidence <= 1.0:
+            raise ValueError("gamble_min_confidence must be >= min_confidence and <= 1")
+        if self.gamble_min_risk_reward < 1.5:
+            raise ValueError("gamble_min_risk_reward must be >= 1.5 (the risk gate's own floor)")
+        if self.gamble_max_per_day < 1 or self.gamble_max_losses_per_day < 1:
+            raise ValueError("gamble daily limits must be at least 1")
+        if self.gamble_max_losses_per_day > self.gamble_max_per_day:
+            raise ValueError("gamble_max_losses_per_day cannot exceed gamble_max_per_day")
+        if self.gamble_breakeven_r <= 0:
+            raise ValueError("gamble_breakeven_r must be positive")
 
         # normalise + auto-detect the MT5 credentials from the environment
         self.mt5_login = self._env_int("mt5_login", self.mt5_login)

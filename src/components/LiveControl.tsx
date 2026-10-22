@@ -16,10 +16,12 @@ import {
   subscribeToBot,
   type AnalyzeResult,
   type BotStatus,
+  type GambleCandidateRow,
+  type GambleStatus,
   type LogLine,
   type PositionRow,
 } from "../lib/botApi";
-import { Chip, Metric, Reveal, SectionHeading, SignalBadge, cx, price, usd } from "./ui";
+import { Chip, Metric, Reveal, SectionHeading, SignalBadge, Slider, cx, price, usd } from "./ui";
 
 /* ── small atoms ───────────────────────────────────────────────────── */
 
@@ -76,6 +78,11 @@ export function LiveControl() {
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [analysis, setAnalysis] = useState<AnalyzeResult | null>(null);
+  const [gamble, setGamble] = useState<GambleStatus | null>(null);
+  const [gambleRanking, setGambleRanking] = useState<GambleCandidateRow[]>([]);
+  const [gambleRiskPct, setGambleRiskPct] = useState(0.02);
+  const [gambleMinConf, setGambleMinConf] = useState(0.6);
+  const [gambleMaxScans, setGambleMaxScans] = useState(60);
   const [toast, setToast] = useState("");
   const [busy, setBusy] = useState("");
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -137,6 +144,55 @@ export function LiveControl() {
     },
     [flash],
   );
+
+  /* gamble: poll the hunt state while the control plane is online */
+  const refreshGamble = useCallback(async () => {
+    try {
+      const g = await botApi.gambleStatus();
+      setGamble(g);
+      if (g.ranking?.length) setGambleRanking(g.ranking);
+    } catch {
+      /* control plane went away — the health path handles the banner */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!online) return;
+    refreshGamble();
+    const t = window.setInterval(refreshGamble, 2500);
+    return () => window.clearInterval(t);
+  }, [online, refreshGamble]);
+
+  const gambleBody = useCallback(
+    () => ({
+      risk_pct: gambleRiskPct,
+      min_confidence: gambleMinConf,
+      max_scans: gambleMaxScans,
+      scan_interval: 5,
+      protect_breakeven: true,
+    }),
+    [gambleRiskPct, gambleMinConf, gambleMaxScans],
+  );
+
+  const scanGamble = useCallback(async () => {
+    setBusy("gamble-scan");
+    try {
+      const res = await botApi.gambleScan(gambleBody());
+      if (res.ranking) setGambleRanking(res.ranking);
+      flash(
+        res.ok
+          ? res.a_plus_available
+            ? `A+ available: ${res.best?.pair} ${res.best?.signal_name} (edge ${res.best?.edge_score.toFixed(1)}) — press GAMBLE to take it`
+            : "No A+ setup right now — the button would (correctly) refuse this market"
+          : res.message ?? "gamble scan refused",
+      );
+      refreshGamble();
+    } catch (err) {
+      flash(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  }, [flash, gambleBody, refreshGamble]);
 
   const runAnalysis = useCallback(async () => {
     setBusy("analyze");
@@ -285,6 +341,125 @@ python api_server.py          # paper mode, 127.0.0.1:8787`}
         <div className="mt-2 font-mono text-[11px] text-muted">
           {status?.status_line || "idle"} · mode {status?.mode ?? "idle"}
         </div>
+
+        {/* ── 🎲 gamble mode on the real bot ──────────────────────── */}
+        {(() => {
+          const gPhase = gamble?.phase ?? "idle";
+          const hunting = gPhase === "hunting";
+          const inTrade = gPhase === "in_trade";
+          const ledger = gamble?.ledger ?? status?.gamble?.ledger ?? {};
+          const balance = Number(risk.balance ?? 10000);
+          const lockReason = String(ledger.lock_reason ?? "");
+          const best = gambleRanking[0];
+          const cand = gamble?.candidate;
+          const monitor = gamble?.monitor;
+          return (
+            <div className="mt-8 overflow-hidden rounded-xl border border-amber/35 bg-panel/55">
+              <div className="flex flex-wrap items-center gap-2.5 border-b border-line px-5 py-3">
+                <span className="font-mono text-[11px] font-bold tracking-[0.22em] text-amber uppercase">🎲 gamble — real bot</span>
+                <span className="font-mono text-[10.5px] text-muted">hunts ONE A+ setup · paper unless a live bot is already running</span>
+                <span className="ml-auto flex flex-wrap gap-1.5">
+                  <Chip tone={hunting ? "amber" : inTrade || gPhase === "won" ? "jade" : gPhase === "lost" || gPhase === "refused" ? "rose" : "line"}>
+                    {hunting ? `hunting ${gamble?.scans ?? 0}/${gamble?.max_scans ?? 0}` : gPhase}
+                  </Chip>
+                  <Chip tone="line">today {ledger.taken ?? 0}/{ledger.max_per_day ?? 3}</Chip>
+                  <Chip tone={Number(ledger.net_pnl ?? 0) >= 0 ? "jade" : "rose"}>net {usd(Number(ledger.net_pnl ?? 0))}</Chip>
+                </span>
+              </div>
+              <div className="grid gap-5 p-5 lg:grid-cols-[290px_minmax(0,1fr)]">
+                <div className="space-y-4">
+                  {hunting ? (
+                    <button
+                      onClick={() => act("stop hunt", () => botApi.gambleStop())}
+                      className="w-full rounded-xl border border-amber/60 bg-amber/15 px-5 py-4 font-mono text-[14px] font-black tracking-[0.16em] text-amber uppercase transition-all hover:bg-amber/25"
+                    >
+                      ◉ hunting… stop
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => act("gamble", () => botApi.gamble(gambleBody()))}
+                      disabled={!!busy || inTrade}
+                      title={inTrade ? "a gamble trade is already open" : lockReason || "Hunt one A+ setup on the Python bot (paper unless live is already running)"}
+                      className={cx(
+                        "w-full rounded-xl border px-5 py-4 font-mono text-[16px] font-black tracking-[0.2em] uppercase transition-all",
+                        inTrade
+                          ? "cursor-not-allowed border-jade/40 bg-jade/10 text-jade"
+                          : "border-amber bg-amber text-ink hover:shadow-[0_0_42px_-8px_rgba(247,178,59,0.9)]",
+                        !!busy && "opacity-40",
+                      )}
+                    >
+                      {inTrade ? `🎯 live · #${cand?.ticket ?? ledger.open_ticket ?? "?"}` : "🎲 gamble"}
+                    </button>
+                  )}
+                  <div className="tabnum text-center font-mono text-[11px] text-muted">
+                    max loss <span className="text-rose">{usd(balance * gambleRiskPct)}</span> → target{" "}
+                    <span className="text-jade">+{usd(balance * gambleRiskPct * 2)}</span> @ RR 2.00
+                  </div>
+                  <Button tone="sky" disabled={!!busy} onClick={scanGamble}>
+                    ◎ preview ranking (no trade)
+                  </Button>
+                  <div className="space-y-3.5 border-t border-line-soft pt-3">
+                    <Slider label="stake" value={gambleRiskPct} min={0.005} max={0.05} step={0.0025} onChange={setGambleRiskPct} display={`${(gambleRiskPct * 100).toFixed(2)}%`} tone="amber" />
+                    <Slider label="A+ min confidence" value={gambleMinConf} min={0.6} max={0.85} step={0.01} onChange={setGambleMinConf} tone="sky" />
+                    <Slider label="hunt budget (scans)" value={gambleMaxScans} min={1} max={240} step={1} onChange={setGambleMaxScans} tone="rose" />
+                  </div>
+                  {(gamble?.reason || lockReason) && (
+                    <p className="font-mono text-[10.5px] leading-relaxed text-sand-2/85">
+                      {lockReason ? `🔒 ${lockReason}` : gamble?.reason}
+                    </p>
+                  )}
+                  {inTrade && monitor && (
+                    <p className="tabnum font-mono text-[11px] leading-relaxed">
+                      <span className={monitor.r_multiple >= 0 ? "text-jade" : "text-rose"}>
+                        {monitor.r_multiple >= 0 ? "+" : ""}{monitor.r_multiple.toFixed(2)}R · {usd(monitor.unrealised_pnl)}
+                      </span>
+                      <span className="text-muted"> @ {monitor.price.toFixed(5)}{monitor.protected ? " · 🛡 breakeven" : ""}</span>
+                    </p>
+                  )}
+                  {inTrade && cand && (
+                    <p className="tabnum font-mono text-[10.5px] leading-relaxed text-muted">
+                      {cand.direction} {cand.pair} {cand.lots} lots · risk {usd(Number(cand.risk_usd ?? 0))} → +{usd(Number(cand.target_usd ?? 0))}
+                    </p>
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="mb-2 font-mono text-[10px] tracking-[0.18em] text-muted uppercase">edge ranking — python strategy, live</div>
+                  {gambleRanking.length === 0 ? (
+                    <div className="py-8 text-center font-mono text-[11.5px] text-muted">
+                      no ranking yet — hit <span className="text-sky">preview ranking</span> or press 🎲 GAMBLE
+                      {best ? "" : <span className="mt-1 block text-[10px]">on the mock/paper feed most markets grade B or skip — the button refusing is it working</span>}
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-line-soft rounded-lg border border-line-soft bg-ink-2/60">
+                      {gambleRanking.map((c) => (
+                        <div key={c.pair} className={cx("px-3.5 py-2.5", c.is_a_plus && "bg-jade/[0.06]")} title={c.failed.length ? `refused: ${c.failed.join("; ")}` : c.passed.join("; ")}>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="w-16 font-mono text-[12px] text-sand">{c.pair}</span>
+                            <SignalBadge signal={c.signal_name} size="sm" />
+                            <span className={cx("rounded border px-1.5 py-0.5 font-mono text-[10px] font-bold", c.grade === "A+" ? "border-jade/50 bg-jade/15 text-jade" : "border-line text-sand-2")}>{c.grade}</span>
+                            <span className="tabnum ml-auto font-mono text-[10.5px] text-muted">
+                              conf {c.confidence.toFixed(2)} · ADX {c.adx == null ? "–" : c.adx.toFixed(0)} · RR {c.risk_reward.toFixed(2)}
+                            </span>
+                            <span className={cx("tabnum w-12 text-right font-mono text-[12px] font-bold", c.is_a_plus ? "text-jade" : "text-sand-2")}>{c.edge_score.toFixed(1)}</span>
+                          </div>
+                          <div className="mt-1 truncate font-mono text-[9.5px] text-muted">
+                            {c.is_a_plus ? <span className="text-jade">★ A+ — bettable at your stake</span> : <span className="text-rose/75">✗ {c.failed.join(" · ")}</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-3 font-mono text-[10px] leading-relaxed text-muted">
+                    Server-enforced: stake ≤5% and ≤ today's remaining loss budget · {ledger.max_per_day ?? 3} gambles/day ·
+                    locks after {ledger.max_losses_per_day ?? 2} losses + 30 min cooldown · breakeven at +1R ·{" "}
+                    <span className="text-rose">no profit guarantee — A+ confluence only</span>. Same engine:{" "}
+                    <code className="text-sky">python gamble.py --mock</code>
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ── positions + logs ───────────────────────────────────── */}
         <div className="mt-8 grid gap-5 lg:grid-cols-2">

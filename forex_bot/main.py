@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -78,6 +79,10 @@ class ForexBot:
         self.signals_seen: int = 0
         self.rejected: int = 0
         self.last_status: str = "booting"
+        #: Serialises anything that can open/close a trade (the tick loop
+        #: and a gamble hunt) so two threads can never size or fill
+        #: against the same account state at the same moment.
+        self.trade_lock = threading.RLock()
 
     # ── remote control ────────────────────────────────────────────────
 
@@ -210,6 +215,11 @@ class ForexBot:
     # ── one iteration ─────────────────────────────────────────────────
 
     def _tick(self) -> None:
+        """One tick, serialised against gamble hunts via ``trade_lock``."""
+        with self.trade_lock:
+            self._tick_locked()
+
+    def _tick_locked(self) -> None:
         """Manage open exposure, then scan every pair for a new signal."""
         now = datetime.now(timezone.utc)
         self._manage_positions(now)

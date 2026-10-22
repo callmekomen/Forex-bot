@@ -33,6 +33,7 @@ const DESK_VERBS = new Set([
   "/risk",
   "/pairs",
   "/tick",
+  "/gamble",
 ]);
 
 export function TelegramRemote() {
@@ -106,7 +107,7 @@ export function TelegramRemote() {
     if (verb === "/help") {
       return {
         msg:
-          "forex_bot commands\n/start · /stop · /status · /positions\n/close <ticket|all> · /halt · /resume\n/risk · /pairs · /id · /pair <code>\nNo command here can size a trade or bypass the risk manager.",
+          "forex_bot commands\n/start · /stop · /status · /positions\n/close <ticket|all> · /halt · /resume\n/risk · /pairs · /id · /pair <code>\n🎲 /gamble · /gamble go · /gamble stop — hunts ONE A+ setup at the desk's capped stake\nNo command here can size a trade or bypass the risk manager.",
       };
     }
     if (DESK_VERBS.has(verb)) {
@@ -209,7 +210,7 @@ export function TelegramRemote() {
             </div>
 
             <div className="flex flex-wrap gap-1 border-t border-line px-3 py-2">
-              {["/status", "/start", "/stop", "/positions", "/halt", "/close all", "/help"].map((q) => (
+              {["/status", "/gamble go", "/gamble", "/start", "/stop", "/positions", "/halt", "/close all", "/help"].map((q) => (
                 <button
                   key={q}
                   onClick={() => send(q)}

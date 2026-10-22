@@ -28,6 +28,14 @@ export interface DeskStatus {
   closedCount: number;
   wins: number;
   pairs: string[];
+  gamble?: {
+    phase: string;
+    taken: number;
+    wins: number;
+    losses: number;
+    netPnl: number;
+    ticket: number | null;
+  };
   limits: {
     riskPct: number;
     minConf: number;
