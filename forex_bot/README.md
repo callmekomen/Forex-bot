@@ -26,6 +26,41 @@ data_feed  →  indicators  →  strategy  →  RISK MANAGER  →  broker  →  
 
 ## 2. Installation
 
+### Windows / PowerShell quickstart (recommended)
+
+From the **repository root** in PowerShell (Python 3.12 64-bit and
+Node.js LTS installed):
+
+```powershell
+git clone https://github.com/callmekomen/Forex-bot.git
+cd Forex-bot
+
+# one-off run if scripts are disabled on your machine:
+powershell -ExecutionPolicy Bypass -File .\forex-bot.ps1 setup
+# ...or allow local scripts for your user once, then use it directly:
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\forex-bot.ps1 setup        # venv + dependencies + risk self-test
+.\forex-bot.ps1 test         # full pytest suite
+.\forex-bot.ps1 scan         # gamble ranking board (trades nothing)
+.\forex-bot.ps1 gamble -Stake 0.02   # hunt ONE A+ setup, paper mode
+.\forex-bot.ps1 dashboard    # API (new window) + web UI + browser
+.\forex-bot.ps1 help         # every command (Get-Help .\forex-bot.ps1 -Full)
+```
+
+Everything is paper-first: a real MT5 terminal account is only touched
+with `-Live`, which still makes you type `LIVE` (use a **demo**
+account). Useful PowerShell idioms around the bot:
+
+```powershell
+Get-Content .\forex_bot\bot.log -Wait -Tail 40     # live log tail (tail -f)
+$env:FXBOT_TELEGRAM_TOKEN = "123456789:AA..."       # env vars, PowerShell style
+$env:FXBOT_TELEGRAM_CHAT_IDS = "734112288"
+.\forex-bot.ps1 bot -Live                            # then start the real loop
+.\forex_bot\.venv\Scripts\Activate.ps1              # activate the venv manually
+```
+
+### Manual install (any OS)
+
 ```bash
 git clone <your-repo> && cd forex_bot
 python -m venv .venv

@@ -1,5 +1,6 @@
 // Single source of truth: the Python files themselves, imported raw by Vite.
 import mainPy from "../../forex_bot/main.py?raw";
+import forexBotPs1 from "../../forex-bot.ps1?raw";
 import configPy from "../../forex_bot/config.py?raw";
 import dataFeedPy from "../../forex_bot/data_feed.py?raw";
 import indicatorsPy from "../../forex_bot/indicators.py?raw";
@@ -42,6 +43,16 @@ export interface SourceFile {
 const loc = (s: string) => s.split("\n").length;
 
 export const FILES: SourceFile[] = [
+  {
+    name: "forex-bot.ps1",
+    path: "forex-bot.ps1",
+    role: "PowerShell console: setup / test / scan / gamble / bot / api / dashboard",
+    note: "The Windows front door. Creates the venv, runs the tests, presses GAMBLE in paper mode, and launches the API + this dashboard. Paper-first: -Live still makes you type LIVE, and there is deliberately no 'exit' in it, so running it interactively never closes your PowerShell window.",
+    lang: "text",
+    icon: "terminal",
+    group: "runtime",
+    code: forexBotPs1,
+  },
   {
     name: "config.py",
     path: "forex_bot/config.py",
