@@ -26,6 +26,41 @@ data_feed  →  indicators  →  strategy  →  RISK MANAGER  →  broker  →  
 
 ## 2. Installation
 
+### Windows / PowerShell quickstart (recommended)
+
+From the **repository root** in PowerShell (Python 3.12 64-bit and
+Node.js LTS installed):
+
+```powershell
+git clone https://github.com/callmekomen/Forex-bot.git
+cd Forex-bot
+
+# one-off run if scripts are disabled on your machine:
+powershell -ExecutionPolicy Bypass -File .\forex-bot.ps1 setup
+# ...or allow local scripts for your user once, then use it directly:
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\forex-bot.ps1 setup        # venv + dependencies + risk self-test
+.\forex-bot.ps1 test         # full pytest suite
+.\forex-bot.ps1 scan         # gamble ranking board (trades nothing)
+.\forex-bot.ps1 gamble -Stake 0.02   # hunt ONE A+ setup, paper mode
+.\forex-bot.ps1 dashboard    # API (new window) + web UI + browser
+.\forex-bot.ps1 help         # every command (Get-Help .\forex-bot.ps1 -Full)
+```
+
+Everything is paper-first: a real MT5 terminal account is only touched
+with `-Live`, which still makes you type `LIVE` (use a **demo**
+account). Useful PowerShell idioms around the bot:
+
+```powershell
+Get-Content .\forex_bot\bot.log -Wait -Tail 40     # live log tail (tail -f)
+$env:FXBOT_TELEGRAM_TOKEN = "123456789:AA..."       # env vars, PowerShell style
+$env:FXBOT_TELEGRAM_CHAT_IDS = "734112288"
+.\forex-bot.ps1 bot -Live                            # then start the real loop
+.\forex_bot\.venv\Scripts\Activate.ps1              # activate the venv manually
+```
+
+### Manual install (any OS)
+
 ```bash
 git clone <your-repo> && cd forex_bot
 python -m venv .venv
@@ -81,6 +116,52 @@ recovers. It never quits on its own and never trades while a halt is latched.
 
 Stop it with `Ctrl+C` — the feed is shut down cleanly and the final state is
 saved. To stop after a bounded run instead, use `--once` or `--ticks N`.
+
+## 3b. 🎲 Gamble mode — one A+ bet, on purpose
+
+Pressing the **GAMBLE** button does not flip a coin. A random trade loses
+to the spread on average, so a literal casino button would just donate
+money to the broker. Gamble mode is the disciplined version of the same
+impulse — "go find me your single best shot, at this stake":
+
+1. **Hunt.** Every pair is scored with the production strategy and ranked
+   by a transparent 0–100 *edge score* (confidence 45 + signal strength
+   20 + trend/ADX 20 + reward:risk 15).
+2. **A+ gate.** A setup only qualifies with confidence ≥ 0.60 (≈ a
+   STRONG-sized score), ADX ≥ 20, RR ≥ 1.8 and edge ≥ 60 — a stricter
+   *combined* bar than any normal trade faces. **No A+ → no bet.** On a
+   dead market most hunts correctly end with nothing.
+3. **Your stake, re-capped.** You pick the risk (dashboard slider,
+   0.5–5%), but sizing still goes through
+   `RiskManager.validate_trade(..., risk_fraction=…)`, which clamps it
+   to `gamble_max_risk_per_trade` (hard ceiling 5%) **and** to the
+   remaining daily-loss budget. Halts, duplicate pairs, session hours
+   and the drawdown breaker apply exactly as usual.
+4. **One and done.** Exactly one position, ATR stop + 1:2 target, then
+   the hunt stops. No martingale, no doubling, no revenge trade.
+5. **Lockout ledger.** `gamble_state.json` caps gambles at 3/day, locks
+   the button after 2 losing gambles in a day, and forces a 30-minute
+   cooldown after a loss — surviving restarts like `bot_state.json`.
+6. **Protection.** At +1R the stop moves to the entry, so a winning
+   gamble can no longer turn into a loser.
+
+At 1:2 RR the breakeven win rate is **33%** — the A+ gate exists to only
+bet when confluence makes beating that plausible. It is still a
+speculation, **not a profit guarantee**; §4b is how you check whether
+the edge is real on your broker's history.
+
+```bash
+python gamble.py --mock               # rank + take ONE paper gamble if A+ exists
+python gamble.py --mock --scan-only   # just the ranking board, trade nothing
+python gamble.py --status             # today's budget / lockout state
+python gamble.py --live               # real terminal — explicit opt-in, demo first
+```
+
+From the dashboard it is the 🎲 panel on the Trading Desk (browser
+simulation) and in Live Control (real Python bot via
+`POST /api/gamble`; paper unless a live bot is already running and
+unlocked — gamble never auto-starts live). From the Telegram desk mock:
+`/gamble go`, `/gamble`, `/gamble stop`.
 
 ## 4. Backtesting
 
@@ -192,6 +273,9 @@ a field with the environment variable `FXBOT_<FIELD>` (uppercase), e.g.
 | Strategy | `rsi_period / rsi_overbought / rsi_oversold` | `14 / 70 / 30` | RSI settings |
 | Strategy | `atr_period / atr_multiplier / take_profit_multiplier` | `14 / 1.5 / 3.0` | SL = 1.5 × ATR, TP = 3 × ATR → **1 : 2 RR** |
 | Strategy | `min_confidence` | `0.6` | Signals below this are rejected |
+| Gamble | `gamble_max_risk_per_trade` | `0.05` | Hard stake ceiling for ONE gamble (also clamped to the remaining daily budget) |
+| Gamble | `gamble_min_confidence / _min_risk_reward / _min_adx / _min_edge_score` | `0.60 / 1.8 / 20 / 60` | The A+ gate — all four must pass or no bet |
+| Gamble | `gamble_max_per_day / _max_losses_per_day / _cooldown_minutes` | `3 / 2 / 30` | Daily lockout ledger in `gamble_state.json` |
 | Schedule | `timeframe` | `1h` | `1m 5m 15m 1h 4h 1d` |
 | Schedule | `tick_interval` | `60` | Seconds between passes |
 | Hours | `start_hour / end_hour` | `7 / 20` | Trade only inside this **UTC** window |
@@ -227,6 +311,7 @@ after a human has reviewed the trading.
 | `data_feed.py` | MT5 candles/ticks, timeframe map, `MockDataFeed` for tests |
 | `indicators.py` | EMA, SMA, RSI, ATR, MACD, Bollinger, Stochastic, ADX (pure static methods) |
 | `strategy.py` | Weighted confluence scoring → `TradeSignal` |
+| `gamble.py` | Edge ranking + A+ gate + lockout ledger; takes ONE capped bet via the risk manager |
 | `risk_manager.py` | Sizing, loss/drawdown halts, hours filter, JSON state |
 | `broker.py` | `order_send` with `magic=123456`, SL/TP, closes, position sync |
 | `backtester.py` | Bar-by-bar replay + performance metrics |

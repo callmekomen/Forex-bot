@@ -24,3 +24,4 @@ bot_state_selftest_*.json
 # Cached market history — data belongs outside git
 forex_bot/data/
 *.parquet
+forex_bot/gamble_state.json

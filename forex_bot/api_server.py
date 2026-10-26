@@ -41,6 +41,16 @@ Endpoints
 ``POST /api/halt``       latch the risk halt now
 ``POST /api/resume``     clear a latched halt
 ``POST /api/backtest``   ``{"pair": "EUR/USD", "bars": 4000}``
+``GET  /api/gamble``     gamble hunt state, ranking and daily ledger
+``POST /api/gamble``     press the button: hunt ONE A+ setup at a capped
+                         stake ``{"risk_pct": 0.02, "max_scans": 60}``
+``POST /api/gamble/scan`` one ranking pass, executes nothing
+``POST /api/gamble/stop`` cancel the hunt/monitor (never closes a trade —
+                         use ``/api/close`` for that)
+
+Gamble mode never auto-starts a live bot: with no bot running it builds
+a paper one; in live mode it rides the already-running, already-unlocked
+live loop and the same risk gates as everything else.
 """
 
 from __future__ import annotations
@@ -60,6 +70,7 @@ from urllib.parse import parse_qs, urlparse
 
 from config import BotConfig
 from data_feed import MockDataFeed
+from gamble import GambleEngine, GambleRequest
 from logger import get_logger
 from main import ForexBot
 
@@ -170,6 +181,23 @@ class BotSupervisor:
         self.started_at: Optional[str] = None
         self.last_error: str = ""
         self._lock = threading.RLock()
+        # Gamble hunt (separate thread; execution serialised by
+        # ForexBot.trade_lock so it can never race the tick loop).
+        self._gamble_engine: Optional[GambleEngine] = None
+        self._gamble_engine_bot: Optional[ForexBot] = None
+        self.gamble_thread: Optional[threading.Thread] = None
+        self._gamble_stop = threading.Event()
+        self.gamble_state: Dict[str, Any] = {
+            "phase": "idle",  # idle|hunting|in_trade|won|lost|closed|expired|refused|cancelled
+            "reason": "",
+            "scans": 0,
+            "max_scans": 0,
+            "ranking": [],
+            "candidate": None,
+            "monitor": None,
+            "request": None,
+            "updated_at": None,
+        }
 
         root = logging.getLogger("forex_bot")
         self.logs.setLevel(logging.INFO)
@@ -256,6 +284,7 @@ class BotSupervisor:
 
     def stop(self) -> Dict[str, Any]:
         """Ask the loop to finish the current tick and exit."""
+        self._gamble_stop.set()  # a hunt must not outlive its bot
         with self._lock:
             if not (self.thread and self.thread.is_alive()) or self.bot is None:
                 return {"ok": False, "message": "bot is not running"}
@@ -340,6 +369,7 @@ class BotSupervisor:
                 except Exception as exc:
                     self.log.error("Dashboard close of %s failed: %s", pos.ticket, exc)
                     results.append({"ticket": pos.ticket, "error": str(exc), "ok": False})
+            self._reconcile_gamble_ledger()  # a flattened gamble settles its ledger too
             return {"ok": True, "closed": results}
 
     # ── read-only analysis ────────────────────────────────────────────
@@ -434,6 +464,279 @@ class BotSupervisor:
             self.log.exception("Backtest failed: %s", exc)
             return {"ok": False, "message": f"backtest failed: {exc}"}
 
+    # ── gamble mode ───────────────────────────────────────────────────
+
+    def _gamble_engine_for(self, bot: ForexBot) -> GambleEngine:
+        """One engine (and one ledger) per bot instance."""
+        if self._gamble_engine is None or self._gamble_engine_bot is not bot:
+            self._gamble_engine = GambleEngine(bot)
+            self._gamble_engine_bot = bot
+        return self._gamble_engine
+
+    def _bot_for_gamble(self) -> ForexBot:
+        """The running bot, or a fresh *paper* one — never an auto-live one."""
+        if self.bot is None:
+            self.bot = self._build("paper")
+            self.mode = "paper"
+        return self.bot
+
+    def _set_gamble_state(self, **fields: Any) -> None:
+        with self._lock:
+            self.gamble_state.update(fields)
+            self.gamble_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    def _reconcile_gamble_ledger(self) -> None:
+        """Book a gamble result into the ledger once its ticket has closed.
+
+        The tick loop (or a manual /api/close) books P&L into the risk
+        trade log; the ledger just mirrors it, exactly once, keyed by
+        ticket — so lockouts survive however the trade ended.
+        """
+        bot = self.bot
+        if bot is None or self._gamble_engine is None:
+            return
+        ledger = self._gamble_engine.ledger
+        ticket = ledger.open_ticket
+        if ticket is None:
+            return
+        if any(p.ticket == ticket for p in bot.risk.open_positions):
+            return  # still open
+        for entry in reversed(bot.risk.trade_log):
+            if entry.get("ticket") == ticket:
+                ledger.record_result(float(entry.get("pnl", 0.0)), ticket)
+                return
+
+    def gamble_status(self) -> Dict[str, Any]:
+        """Hunt phase, last ranking, open-gamble monitor and the ledger."""
+        self._reconcile_gamble_ledger()
+        with self._lock:
+            state = dict(self.gamble_state)
+        ledger: Dict[str, Any] = {}
+        if self.bot is not None:
+            ledger = self._gamble_engine_for(self.bot).ledger.status()
+        active = bool(self.gamble_thread and self.gamble_thread.is_alive())
+        return {"ok": True, "active": active, "mode": self.mode, "ledger": ledger, **state}
+
+    def gamble_scan(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """One ranking pass — what the button *would* bet on, trading nothing."""
+        try:
+            request, err = self._gamble_request(body)
+            if err:
+                return {"ok": False, "message": err}
+            assert request is not None
+            bot = self._bot_for_gamble()
+            engine = self._gamble_engine_for(bot)
+            ranking = engine.scan(request)
+            board = [c.to_dict() for c in ranking]
+            self._set_gamble_state(ranking=board)
+            best = next((c for c in ranking if c.is_a_plus), None)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "a_plus_available": best is not None,
+                "best": best.to_dict() if best else None,
+                "ranking": board,
+                "ledger": engine.ledger.status(),
+            }
+        except Exception as exc:
+            self.log.exception("Gamble scan failed: %s", exc)
+            return {"ok": False, "message": f"gamble scan failed: {exc}"}
+
+    def _gamble_request(self, body: Dict[str, Any]) -> Tuple[Optional[GambleRequest], str]:
+        """Validate button parameters; ``(request, "")`` or ``(None, why)``."""
+        cfg = self.bot.config if self.bot else BotConfig()
+        mode = str(body.get("mode", "")).lower()
+        if mode == "live" and self.mode != "live":
+            return None, (
+                "gamble never auto-starts live trading — unlock live and press "
+                "'start live' first, then gamble on the running bot"
+            )
+        try:
+            risk = float(body.get("risk_pct", body.get("risk_fraction", 0.02)))
+        except (TypeError, ValueError):
+            return None, "risk_pct must be a number like 0.02 (2% of equity)"
+        if not 0 < risk <= 0.05:
+            return None, "risk_pct must be in (0, 0.05] — a gamble may never risk more than 5% of equity"
+        try:
+            min_conf = float(body.get("min_confidence", cfg.gamble_min_confidence))
+        except (TypeError, ValueError):
+            return None, "min_confidence must be a number"
+        if not cfg.min_confidence <= min_conf <= 1.0:
+            return None, f"min_confidence must be between the normal floor ({cfg.min_confidence}) and 1"
+        pairs_raw = body.get("pairs")
+        pairs = [str(p) for p in pairs_raw] if isinstance(pairs_raw, list) else None
+        return GambleRequest(
+            risk_fraction=risk,
+            min_confidence=min_conf,
+            min_risk_reward=cfg.gamble_min_risk_reward,
+            min_adx=cfg.gamble_min_adx,
+            min_edge_score=cfg.gamble_min_edge_score,
+            pairs=pairs,
+        ), ""
+
+    def gamble_start(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Press the button: hunt up to ``max_scans`` times for one A+ bet."""
+        with self._lock:
+            if self.gamble_thread and self.gamble_thread.is_alive():
+                return {"ok": False, "message": "a gamble hunt is already running — stop it first"}
+            request, err = self._gamble_request(body)
+            if err:
+                return {"ok": False, "message": err}
+            assert request is not None
+            try:
+                max_scans = max(1, min(1000, int(body.get("max_scans", 60))))
+                interval = max(1.0, min(60.0, float(body.get("scan_interval", 5))))
+            except (TypeError, ValueError):
+                return {"ok": False, "message": "max_scans / scan_interval must be numbers"}
+            protect = bool(body.get("protect_breakeven", True))
+            try:
+                bot = self._bot_for_gamble()
+            except Exception as exc:
+                return {"ok": False, "message": f"failed to build bot: {exc}"}
+            engine = self._gamble_engine_for(bot)
+            allowed, why = engine.ledger.can_gamble()
+            if not allowed:
+                self._set_gamble_state(phase="refused", reason=why)
+                return {"ok": False, "message": f"gamble locked: {why}", "ledger": engine.ledger.status()}
+            self._gamble_stop.clear()
+            self._set_gamble_state(
+                phase="hunting", reason="", scans=0, max_scans=max_scans,
+                ranking=[], candidate=None, monitor=None,
+                request={
+                    "risk_fraction": request.risk_fraction,
+                    "min_confidence": request.min_confidence,
+                    "max_scans": max_scans, "scan_interval": interval,
+                    "protect_breakeven": protect, "mode": self.mode,
+                },
+            )
+            self.gamble_thread = threading.Thread(
+                target=self._gamble_loop,
+                args=(bot, engine, request, max_scans, interval, protect),
+                name="gamble-hunt", daemon=True,
+            )
+            self.gamble_thread.start()
+            self.log.info(
+                "🎲 GAMBLE hunt started (%s mode, stake %.2f%%, up to %d scans).",
+                self.mode, request.risk_fraction * 100, max_scans,
+            )
+            return {
+                "ok": True,
+                "message": f"hunting for one A+ setup — stake {request.risk_fraction:.2%} of equity, "
+                           f"max {max_scans} scans, {self.mode} mode",
+                "ledger": engine.ledger.status(),
+            }
+
+    def gamble_stop(self) -> Dict[str, Any]:
+        """Cancel the hunt/monitor. An open gamble keeps its SL/TP (use /api/close)."""
+        active = bool(self.gamble_thread and self.gamble_thread.is_alive())
+        self._gamble_stop.set()
+        if active:
+            self._set_gamble_state(phase="cancelled", reason="hunt cancelled by operator (open trades unaffected)")
+        return {"ok": True, "message": "gamble hunt cancelled" if active else "no gamble hunt was running"}
+
+    def _gamble_loop(
+        self,
+        bot: ForexBot,
+        engine: GambleEngine,
+        request: GambleRequest,
+        max_scans: int,
+        interval: float,
+        protect: bool,
+    ) -> None:
+        """Hunt thread: scan → maybe take ONE → monitor it to its result."""
+        scans = 0
+        try:
+            while not self._gamble_stop.is_set() and scans < max_scans:
+                scans += 1
+                with bot.trade_lock:
+                    result = engine.hunt_once(request)
+                self._set_gamble_state(
+                    scans=scans, ranking=result.get("ranking", []),
+                    reason=str(result.get("reason", "")),
+                )
+                if result.get("taken"):
+                    candidate = result.get("candidate") or {}
+                    self._set_gamble_state(phase="in_trade", candidate=candidate)
+                    self._gamble_monitor(bot, engine, int(candidate.get("ticket", 0)), interval, protect)
+                    return
+                reason = str(result.get("reason", ""))
+                if not result.get("ok") or not reason.startswith("no A+ setup"):
+                    self._set_gamble_state(phase="refused", reason=reason)
+                    return
+                if scans < max_scans:
+                    self._gamble_stop.wait(interval)
+            if scans >= max_scans and not self._gamble_stop.is_set():
+                self._set_gamble_state(
+                    phase="expired",
+                    reason=f"hunt expired after {max_scans} scan(s) — no A+ setup, no bet placed",
+                )
+                self.log.info("🎲 GAMBLE hunt expired with no A+ setup — no bet placed.")
+        except Exception as exc:  # pragma: no cover - defensive
+            self.log.exception("Gamble hunt crashed: %s", exc)
+            self._set_gamble_state(phase="refused", reason=f"hunt crashed: {exc}")
+
+    def _gamble_monitor(
+        self,
+        bot: ForexBot,
+        engine: GambleEngine,
+        ticket: int,
+        interval: float,
+        protect: bool,
+    ) -> None:
+        """Watch the open gamble: breakeven-protect at +1R, book the result.
+
+        When the tick loop is running it owns SL/TP exits; when it is
+        not (paper bot built for the button), the monitor enforces the
+        same levels itself so the gamble still ends honestly.
+        """
+        while not self._gamble_stop.is_set():
+            pos = next((p for p in list(bot.risk.open_positions) if p.ticket == ticket), None)
+            if pos is None:
+                break  # closed — fall through to reconciliation
+            try:
+                tick = bot.feed.get_latest_tick(pos.pair)
+                bid, ask = float(tick["bid"]), float(tick["ask"])
+                mid = (bid + ask) / 2.0
+            except Exception:
+                self._gamble_stop.wait(min(interval, 5.0))
+                continue
+            protected = False
+            if protect:
+                with bot.trade_lock:
+                    protected = bool(engine.maybe_protect_breakeven(pos, mid))
+            exit_now = (bid <= pos.stop_loss or bid >= pos.take_profit) if pos.is_long else (
+                ask >= pos.stop_loss or ask <= pos.take_profit
+            )
+            loop_running = bool(self.thread and self.thread.is_alive())
+            if exit_now and not loop_running:
+                with bot.trade_lock:
+                    pnl = bot.broker.close_trade(pos, reason="gamble_exit")
+                    bot.risk.record_close(pnl, pos, reason="gamble_exit")
+                break
+            already_protected = pos.stop_loss >= pos.open_price if pos.is_long else pos.stop_loss <= pos.open_price
+            self._set_gamble_state(monitor={
+                "ticket": ticket,
+                "price": round(mid, 5),
+                "r_multiple": engine.r_multiple(pos, mid),
+                "unrealised_pnl": pos.unrealised_pnl(
+                    mid, bot.config.pip_size_for(pos.pair), bot.config.pip_value
+                ),
+                "protected": bool(protected or already_protected),
+            })
+            self._gamble_stop.wait(min(interval, 5.0))
+        self._reconcile_gamble_ledger()
+        ledger = engine.ledger.status()
+        if ledger.get("open_ticket") is None:
+            last = next(
+                (e for e in reversed(bot.risk.trade_log) if e.get("ticket") == ticket), None,
+            )
+            pnl = float(last.get("pnl", 0.0)) if last else 0.0
+            phase = "won" if pnl > 0 else "lost" if pnl < 0 else "closed"
+            self._set_gamble_state(
+                phase=phase, reason=f"gamble closed {pnl:+.2f} USD (ticket {ticket})", monitor=None,
+            )
+            self.log.info("🎲 GAMBLE ticket %s settled: %+.2f USD (%s)", ticket, pnl, phase.upper())
+
     # ── snapshots ─────────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
@@ -459,6 +762,7 @@ class BotSupervisor:
                     "status_line": "no bot instance — press Start",
                     "risk": {},
                     "account": {},
+                    "gamble": {"phase": self.gamble_state.get("phase", "idle"), "ledger": {}},
                 }
             )
             return payload
@@ -472,6 +776,10 @@ class BotSupervisor:
                 "rejected": bot.rejected,
                 "status_line": bot.last_status,
                 "risk": stats,
+                "gamble": {
+                    "phase": self.gamble_state.get("phase", "idle"),
+                    "ledger": self._gamble_engine_for(bot).ledger.status(),
+                },
                 "account": {
                     "login": fingerprint.get("login"),
                     "server": fingerprint.get("server"),
@@ -641,6 +949,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             limit = int(query.get("limit", ["200"])[0] or 200)
             after = int(query.get("after", ["0"])[0] or 0)
             self._send({"ok": True, "lines": sup.logs.tail(limit, after)})
+        elif route == "/api/gamble":
+            self._send(sup.gamble_status())
         elif route == "/api/events":
             self._stream_events()
         else:
@@ -670,6 +980,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 int(body.get("bars", 4000) or 4000),
                 float(body.get("spread", 1.5) or 1.5),
             ),
+            "/api/gamble": lambda: sup.gamble_start(body),
+            "/api/gamble/scan": lambda: sup.gamble_scan(body),
+            "/api/gamble/stop": sup.gamble_stop,
         }
         action = actions.get(route)
         if action is None:

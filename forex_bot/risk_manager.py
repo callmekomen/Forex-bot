@@ -178,12 +178,26 @@ class RiskManager:
     # Gate #2 — sizing
     # ─────────────────────────────────────────────────────────────────
 
+    def remaining_daily_loss_budget(self) -> float:
+        """Cash that may still be lost today before the daily halt latches.
+
+        ``max_daily_loss`` dollars, less what is already lost (a profitable
+        day does *not* raise the budget above the configured limit).
+        """
+        limit = abs(self.config.max_daily_loss_dollars)
+        return round(max(0.0, limit + min(0.0, self.daily_pnl)), 2)
+
     def calculate_position_size(
-        self, direction: str, entry: float, stop_loss: float, pair: str = ""
+        self,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        pair: str = "",
+        risk_fraction: Optional[float] = None,
     ) -> float:
         """Fixed-fractional lot size from the stop distance.
 
-        ``lots = (balance × max_risk_per_trade) / (pips × pip_value)``
+        ``lots = (balance × risk_fraction) / (pips × pip_value)``
 
         Args:
             direction: ``"BUY"`` / ``"SELL"`` (accepted for symmetry; the
@@ -191,6 +205,10 @@ class RiskManager:
             entry: Planned entry price.
             stop_loss: Protective stop price.
             pair: Instrument, used to auto-detect JPY pip size.
+            risk_fraction: Optional explicit fraction (gamble mode only).
+                Clamped to ``gamble_max_risk_per_trade`` and to the
+                remaining daily-loss budget. ``None`` (the default, used by
+                the normal loop) means ``max_risk_per_trade`` — unchanged.
 
         Returns:
             Lot size rounded down to 0.01 steps, at least the broker minimum,
@@ -204,7 +222,18 @@ class RiskManager:
         pips = distance / pip_size
         if pips < 1e-9:
             return 0.0
-        max_risk_dollars = self.current_balance * self.config.max_risk_per_trade
+        if risk_fraction is None:
+            max_risk_dollars = self.current_balance * self.config.max_risk_per_trade
+        else:
+            fraction = float(risk_fraction)
+            if not math.isfinite(fraction) or fraction <= 0:
+                self.log.warning("Invalid gamble risk fraction (%s) — sizing refused", risk_fraction)
+                return 0.0
+            fraction = min(fraction, float(getattr(self.config, "gamble_max_risk_per_trade", 0.05)), 0.05)
+            max_risk_dollars = min(
+                self.current_balance * fraction,
+                self.remaining_daily_loss_budget(),
+            )
         raw_lots = max_risk_dollars / (pips * self.config.pip_value)
         if not math.isfinite(raw_lots) or raw_lots <= 0:
             return 0.0
@@ -225,13 +254,23 @@ class RiskManager:
     # ─────────────────────────────────────────────────────────────────
 
     def validate_trade(
-        self, signal: TradeSignal, now: Optional[datetime] = None
+        self,
+        signal: TradeSignal,
+        now: Optional[datetime] = None,
+        risk_fraction: Optional[float] = None,
     ) -> Tuple[bool, float, str]:
         """Approve/reject *signal* and return ``(approved, lots, reason)``.
 
         Checks, in order: global gate → confidence → reward:risk → duplicate
         pair → sizing → realised-risk cap. Lots are shaved down (never up)
-        until the stop-loss scenario fits inside ``max_risk_per_trade``.
+        until the stop-loss scenario fits inside the risk cap.
+
+        Args:
+            risk_fraction: Gamble mode only — an explicit stake fraction.
+                It is clamped to ``gamble_max_risk_per_trade`` (hard ceiling
+                5%) **and** to the remaining daily-loss budget, so a gamble
+                can size up a little but can never outrun the circuit
+                breakers. ``None`` keeps the normal ``max_risk_per_trade``.
         """
         allowed, gate_reason = self.can_trade(now)
         if not allowed:
@@ -260,13 +299,24 @@ class RiskManager:
                     f"(ticket {open_pos.ticket})"
                 )
 
-        lots = self.calculate_position_size(signal.direction, signal.price, signal.stop_loss, signal.pair)
+        lots = self.calculate_position_size(
+            signal.direction, signal.price, signal.stop_loss, signal.pair,
+            risk_fraction=risk_fraction,
+        )
         if lots <= 0:
             return False, 0.0, "calculated lot size is zero — stop too wide for the risk budget"
 
         # verify (and if necessary reduce) realised risk
         projected = self.risk_dollars(lots, signal.price, signal.stop_loss, signal.pair)
-        cap = self.current_balance * self.config.max_risk_per_trade
+        if risk_fraction is None:
+            cap = self.current_balance * self.config.max_risk_per_trade
+        else:
+            fraction = min(
+                float(risk_fraction),
+                float(getattr(self.config, "gamble_max_risk_per_trade", 0.05)),
+                0.05,
+            )
+            cap = min(self.current_balance * fraction, self.remaining_daily_loss_budget())
         while projected > cap and lots > 0.01:
             lots = round(lots - 0.01, 2)
             projected = self.risk_dollars(lots, signal.price, signal.stop_loss, signal.pair)
