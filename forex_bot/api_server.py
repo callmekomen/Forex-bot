@@ -785,6 +785,8 @@ class BotSupervisor:
                     "server": fingerprint.get("server"),
                     "currency": fingerprint.get("currency", "USD"),
                     "verified": fingerprint.get("verified", False),
+                    "account_kind": fingerprint.get("account_kind"),
+                    "is_demo": fingerprint.get("is_demo"),
                     "paper": self.mode == "paper",
                 },
             }

@@ -3,6 +3,7 @@ import mainPy from "../../forex_bot/main.py?raw";
 import forexBotPs1 from "../../forex-bot.ps1?raw";
 import configPy from "../../forex_bot/config.py?raw";
 import dataFeedPy from "../../forex_bot/data_feed.py?raw";
+import demoCheckPy from "../../forex_bot/demo_check.py?raw";
 import indicatorsPy from "../../forex_bot/indicators.py?raw";
 import strategyPy from "../../forex_bot/strategy.py?raw";
 import gamblePy from "../../forex_bot/gamble.py?raw";
@@ -116,12 +117,22 @@ export const FILES: SourceFile[] = [
   {
     name: "data_feed.py",
     path: "forex_bot/data_feed.py",
-    role: "MT5 candles + ticks, timeframe map, injectable MockDataFeed",
-    note: "Every failure raises DataFeedError with an actionable message. MockDataFeed satisfies the same protocol, so tests and CI need no terminal.",
+    role: "MT5 candles + ticks, timeframe map, demo-only account lock, MockDataFeed",
+    note: "At connect it reads the terminal account's trade_mode: demo/contest pass, REAL-money accounts are refused and disconnected unless FXBOT_ALLOW_REAL_ACCOUNT=1, and unreadable kinds fail closed. Every failure raises DataFeedError with an actionable message; MockDataFeed satisfies the same protocol, so tests and CI need no terminal.",
     lang: "python",
     icon: "satellite",
     group: "execution",
     code: dataFeedPy,
+  },
+  {
+    name: "demo_check.py",
+    path: "forex_bot/demo_check.py",
+    role: "Read-only MT5 demo preflight — proves demo + data before any -Live run",
+    note: "Connects (firing the demo-only lock), prints account kind/balance, warns when the demo deposit disagrees with config.account_balance (sizing uses the configured number), checks permissions/session/per-pair candles+tick+signal and the gamble board. Never constructs a Broker, so it cannot place an order. `python demo_check.py --mock` runs it with no terminal.",
+    lang: "python",
+    icon: "shield",
+    group: "research",
+    code: demoCheckPy,
   },
   {
     name: "broker.py",
