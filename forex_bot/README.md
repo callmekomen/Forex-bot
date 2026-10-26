@@ -163,6 +163,51 @@ simulation) and in Live Control (real Python bot via
 unlocked — gamble never auto-starts live). From the Telegram desk mock:
 `/gamble go`, `/gamble`, `/gamble stop`.
 
+## 3c. 🧪 Test on your MT5 **demo** account (real prices, fake money)
+
+The bot is now **demo-only by default**: `data_feed.py` reads the
+terminal's account type (`trade_mode`) at connect time and refuses a
+REAL-money account — before the strategy or broker layer even loads.
+Demo and contest (virtual) accounts pass; an unreadable account type
+fails closed too. Real accounts only connect with the deliberate opt-in
+`allow_real_account = True` or `FXBOT_ALLOW_REAL_ACCOUNT=1`, and you
+should not touch that until §4b and a full demo week behind you.
+
+```powershell
+# 1. MT5 open + logged into a DEMO account (open a $10,000 one — see below)
+# 2. Pin that exact demo account so the bot refuses any other terminal login:
+$env:FXBOT_MT5_LOGIN = '12345678'          # your demo login number
+$env:FXBOT_MT5_SERVER = 'YourBroker-Demo'  # exact name from MT5's Navigator
+
+.\forex-bot.ps1 check                      # read-only preflight: NO orders placed
+.\forex-bot.ps1 scan -Live                 # gamble ranking on REAL prices, trades nothing
+.\forex-bot.ps1 gamble -Live -Stake 0.005  # first demo gamble at a tiny 0.5% stake
+```
+
+(`python demo_check.py` / `python gamble.py --live` are the same things
+without the console script.)
+
+What `check` verifies: the MetaTrader5 package and terminal connect,
+the account really is DEMO (a REAL account aborts the whole bot, not
+just the check), trading permissions, the UTC session window, candles
++ tick + spread + the production signal for every pair, and the gamble
+board on live prices — all without constructing a broker.
+
+Two things that trip first-timers up:
+
+- **Balance.** Risk sizing uses `config.account_balance` (default
+  $10,000), not the terminal's equity. Open your demo at $10,000 — or
+  edit `account_balance` to match — or every stake is sized against
+  money that isn't there (or only a fraction of it). `check` warns.
+- **Hours.** Forex is closed on weekends (and the bot sits out outside
+  07:00–20:00 UTC = 08:00–21:00 WAT), so a Sunday run validates
+  login/candles but no ticks move and no hunt can bet.
+
+Verify every test fill in MT5 itself (Toolbox → Trade, bot orders
+carry magic `123456`) against `bot.log`. Stay on demo for **at least a
+full trading week**, then run §4b's walk-forward on your broker's real
+history before even thinking about the unlock above.
+
 ## 4. Backtesting
 
 ```bash
@@ -254,16 +299,19 @@ second half exists.
 
 ## 5. Configuration (`config.py`)
 
-Everything lives in the `BotConfig` dataclass — edit the defaults, or override
-a field with the environment variable `FXBOT_<FIELD>` (uppercase), e.g.
-`FXBOT_MAX_RISK_PER_TRADE=0.01`. MT5 credentials are read from
-`FXBOT_MT5_LOGIN`, `FXBOT_MT5_PASSWORD`, `FXBOT_MT5_SERVER`
-(leave them unset to reuse the terminal that is already logged in).
+Everything lives in the `BotConfig` dataclass — edit the defaults to
+change behaviour. Environment variables are deliberately narrow in scope
+(there is **no** generic `FXBOT_<FIELD>` override): MT5 identity
+(`FXBOT_MT5_LOGIN`, `FXBOT_MT5_PASSWORD`, `FXBOT_MT5_SERVER`,
+`FXBOT_MT5_TERMINAL_PATH` — leave unset to reuse the terminal that is
+already logged in), Telegram secrets, and the real-account unlock
+`FXBOT_ALLOW_REAL_ACCOUNT`.
 
 | Group | Field | Default | Meaning |
 |---|---|---|---|
 | Universe | `pairs` | `EUR/USD, GBP/USD, USD/JPY` | Instruments scanned each tick |
-| Account | `account_balance` / `lot_size` / `leverage` | `10000.0 / 0.01 / 100` | Starting equity & broker base lot |
+| Account | `account_balance` / `lot_size` / `leverage` | `10000.0 / 0.01 / 100` | Starting equity & broker base lot — **sizing uses this number**, so match your demo deposit to it |
+| Account lock | `allow_real_account` | `False` (or `FXBOT_ALLOW_REAL_ACCOUNT=1`) | When off, REAL-money (and unreadable) terminal accounts are refused at connect — see §3c |
 | Risk | `max_risk_per_trade` | `0.02` | Max **2 %** of equity at risk per trade |
 | Risk | `max_daily_loss` | `0.05` | **5 %** realised loss → halt until next UTC day |
 | Risk | `max_open_positions` | `3` | Concurrent exposure cap |
@@ -308,7 +356,8 @@ after a human has reviewed the trading.
 |---|---|
 | `main.py` | `ForexBot` tick loop, CLI, banner, graceful shutdown |
 | `config.py` | `BotConfig` dataclass + validation |
-| `data_feed.py` | MT5 candles/ticks, timeframe map, `MockDataFeed` for tests |
+| `data_feed.py` | MT5 candles/ticks, timeframe map, demo-only account lock, `MockDataFeed` for tests |
+| `demo_check.py` | Read-only MT5 demo preflight (account kind, data, signals — never trades) |
 | `indicators.py` | EMA, SMA, RSI, ATR, MACD, Bollinger, Stochastic, ADX (pure static methods) |
 | `strategy.py` | Weighted confluence scoring → `TradeSignal` |
 | `gamble.py` | Edge ranking + A+ gate + lockout ledger; takes ONE capped bet via the risk manager |
