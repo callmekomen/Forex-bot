@@ -110,6 +110,13 @@ class ForexDataFeed:
             )
 
         # ── identity check: prove we are about to trade the account we think we are
+        raw_trade_mode = getattr(account, "trade_mode", None)
+        try:
+            trade_mode: Optional[int] = int(raw_trade_mode) if raw_trade_mode is not None else None
+        except (TypeError, ValueError):
+            trade_mode = None
+        # MT5 ACCOUNT_TRADE_MODE_*: 0=demo, 1=contest (virtual money), 2=real
+        account_kind = {0: "demo", 1: "contest", 2: "real"}.get(trade_mode, "unknown")
         self.account_fingerprint = {
             "login": int(getattr(account, "login", 0) or 0),
             "server": str(getattr(account, "server", "") or ""),
@@ -117,9 +124,35 @@ class ForexDataFeed:
             "balance": float(getattr(account, "balance", 0.0) or 0.0),
             "leverage": int(getattr(account, "leverage", 0) or 0),
             "company": str(getattr(account, "company", "") or ""),
+            "trade_mode": trade_mode,
+            "account_kind": account_kind,
+            "is_demo": account_kind == "demo",
             "verified": False,
             "symbols": [],
         }
+
+        # ── DEMO-ONLY LOCK: never wire this bot to real money by accident.
+        # Fail closed: an account whose kind cannot be proven to be demo
+        # (or virtual-money contest) is treated as untouchable.
+        if not getattr(self.config, "allow_real_account", False):
+            if account_kind == "real":
+                self.connected = False
+                self.mt5.shutdown()
+                raise DataFeedError(
+                    f"REAL ACCOUNT — refusing to trade: login {self.account_fingerprint['login']} @ "
+                    f"{self.account_fingerprint['server']} is a REAL-money account (trade_mode=2) and this "
+                    "bot is locked to demo. Log the terminal into a DEMO account and start again. "
+                    "Only after a full demo forward test, deliberate real trading needs "
+                    "FXBOT_ALLOW_REAL_ACCOUNT=1."
+                )
+            if account_kind == "unknown":
+                self.connected = False
+                self.mt5.shutdown()
+                raise DataFeedError(
+                    "ACCOUNT KIND UNKNOWN — refusing to trade: account_info() did not report a usable "
+                    f"trade_mode (got {raw_trade_mode!r}), so demo status cannot be proven. Log into a "
+                    "DEMO account, or set FXBOT_ALLOW_REAL_ACCOUNT=1 if you really mean this account."
+                )
         mismatches: List[str] = []
         if self.config.mt5_login and self.account_fingerprint["login"] != int(self.config.mt5_login):
             mismatches.append(
@@ -140,15 +173,20 @@ class ForexDataFeed:
         self.account_fingerprint["verified"] = bool(self.config.mt5_login) and not mismatches
 
         self.log.info(
-            "Connected to MT5 terminal '%s' (build %s) — account %s @ %s, balance %.2f %s, fingerprint verified=%s",
+            "Connected to MT5 terminal '%s' (build %s) — account %s @ %s, balance %.2f %s, %s account, fingerprint verified=%s",
             getattr(info, "name", "unknown"),
             getattr(info, "build", "?"),
             self.account_fingerprint["login"],
             self.account_fingerprint["server"] or "?",
             self.account_fingerprint["balance"],
             self.account_fingerprint["currency"],
+            self.account_fingerprint["account_kind"].upper(),
             self.account_fingerprint["verified"],
         )
+        if self.account_fingerprint["account_kind"] == "real":
+            self.log.critical(
+                "REAL-MONEY account connected (allow_real_account is ON) — every order moves real funds."
+            )
         if mismatches:
             self.log.warning("Trading an UNVERIFIED account (require_account_match=False): %s", "; ".join(mismatches))
 

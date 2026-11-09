@@ -440,8 +440,30 @@ class GambleEngine:
         wanted = request.pairs or list(self.config.pairs)
         return [p for p in wanted if p in self.config.pairs] or list(self.config.pairs)
 
+    def _ensure_feed(self) -> None:
+        """Connect the feed if a gamble entry point is driving the bot.
+
+        The tick loop connects lazily, but the CLI / API hunt paths call
+        :meth:`scan` directly — against a real MT5 feed that means
+        ``initialize()`` must happen here first (which is also where
+        the demo-only account lock fires), or every pair silently
+        fails with "not initialized". Duck-typed on purpose: mock
+        feeds carry the same ``connected``/``initialize()`` shape, and
+        test fakes without ``connected`` are treated as ready.
+        """
+        feed = self.bot.feed
+        if getattr(feed, "connected", True) is False and hasattr(feed, "initialize"):
+            feed.initialize()
+
     def scan(self, request: GambleRequest) -> List[GambleCandidate]:
-        """Score every pair once and return the edge ranking (no trading)."""
+        """Score every pair once and return the edge ranking (no trading).
+
+        Raises:
+            Exception: whatever feed ``initialize()`` raises (e.g. the
+                demo-only lock refusing a real account) — connection
+                failures must be loud, never an empty ranking.
+        """
+        self._ensure_feed()
         signals: List[TradeSignal] = []
         for pair in self._pairs(request):
             try:
@@ -486,7 +508,12 @@ class GambleEngine:
         if execute and not allowed:
             return {"ok": False, "taken": False, "reason": f"risk gate closed: {why}", "ledger": self.ledger.status(moment)}
 
-        ranking = self.scan(req)
+        try:
+            ranking = self.scan(req)
+        except Exception as exc:  # feed won't connect (incl. REAL-account lock)
+            self.log.error("GAMBLE refused: feed not ready — %s", exc)
+            return {"ok": False, "taken": False, "reason": f"feed not ready: {exc}",
+                    "ranking": [], "ledger": self.ledger.status(moment)}
         board = [c.to_dict() for c in ranking]
         best = next((c for c in ranking if c.is_a_plus), None)
         if best is None:

@@ -7,6 +7,7 @@
 
       .\forex-bot.ps1 setup        create forex_bot\.venv, install deps, self-test
       .\forex-bot.ps1 test         run the full pytest suite + risk self-test
+      .\forex-bot.ps1 check        read-only MT5 DEMO preflight - places NO orders
       .\forex-bot.ps1 scan         gamble ranking board only - trades NOTHING
       .\forex-bot.ps1 gamble       hunt ONE A+ setup and take it (paper by default)
       .\forex-bot.ps1 status       today's gamble budget / lockout state
@@ -30,7 +31,7 @@
       powershell -ExecutionPolicy Bypass -File .\forex-bot.ps1 setup
 
 .PARAMETER Command
-    setup | test | scan | gamble | status | bot | api | dashboard | backtest | help
+    setup | test | check | scan | gamble | status | bot | api | dashboard | backtest | help
 
 .PARAMETER Stake
     Gamble stake as a fraction of equity (0.02 = 2%, max 0.05).
@@ -68,7 +69,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('setup', 'test', 'scan', 'gamble', 'status', 'bot', 'api', 'dashboard', 'backtest', 'help')]
+    [ValidateSet('setup', 'test', 'check', 'scan', 'gamble', 'status', 'bot', 'api', 'dashboard', 'backtest', 'help')]
     [string]$Command = 'help',
 
     [double]$Stake = 0.02,
@@ -241,6 +242,7 @@ function Invoke-Setup {
     Write-Host ''
     Write-Host '[setup] DONE. Next steps:' -ForegroundColor Green
     Write-Host '  .\forex-bot.ps1 test        run all tests'
+    Write-Host '  .\forex-bot.ps1 check       verify your MT5 DEMO account (read-only, no orders)'
     Write-Host '  .\forex-bot.ps1 scan        see the gamble ranking (trades nothing)'
     Write-Host '  .\forex-bot.ps1 gamble      hunt ONE A+ setup in paper mode'
     Write-Host '  .\forex-bot.ps1 dashboard   web UI with the big GAMBLE button'
@@ -265,6 +267,19 @@ function Invoke-Test {
     Invoke-Python -PyArgs @('main.py', '--self-test')
     if ($LASTEXITCODE -ne 0) { throw '[test] self-test FAILED' }
     Write-Host '[test] ALL GREEN' -ForegroundColor Green
+}
+
+function Invoke-Check {
+    # Read-only by design (demo_check.py never builds a Broker), so there
+    # is deliberately no LIVE confirmation prompt here. Connecting to a
+    # REAL account is refused inside python by the demo-only lock, which
+    # is exactly what this command exists to show you.
+    Write-Host '[check] read-only MT5 demo preflight - places NO orders' -ForegroundColor Cyan
+    Write-Host '[check] make sure MT5 is OPEN and logged into your DEMO account' -ForegroundColor DarkGray
+    $checkArgs = @('demo_check.py')
+    if ($Pairs) { $checkArgs += @('--pairs', $Pairs) }
+    if ($Rest) { $checkArgs += $Rest }
+    Invoke-Python -PyArgs $checkArgs
 }
 
 function Get-GambleArgs {
@@ -400,6 +415,7 @@ Usage:  .\forex-bot.ps1 <command> [options]
 Commands:
   setup       create venv + install everything + self-test   (run this first)
   test        full pytest suite + risk self-test
+  check       read-only MT5 DEMO preflight - places NO orders (run before -Live)
   scan        gamble ranking board - trades NOTHING
   gamble      hunt ONE A+ setup, take it at -Stake (paper unless -Live)
   status      gamble budget/lockout + API bot status if running
@@ -418,6 +434,7 @@ Options:
 Quick start:
   powershell -ExecutionPolicy Bypass -File .\forex-bot.ps1 setup
   .\forex-bot.ps1 test
+  .\forex-bot.ps1 check
   .\forex-bot.ps1 scan
   .\forex-bot.ps1 gamble -Stake 0.02
   .\forex-bot.ps1 dashboard
@@ -439,6 +456,7 @@ $script:ResultCode = 0
 switch ($Command) {
     'setup'     { Invoke-Setup }
     'test'      { Invoke-Test }
+    'check'     { Invoke-Check;     $script:ResultCode = $LASTEXITCODE }
     'scan'      { Invoke-Scan;      $script:ResultCode = $LASTEXITCODE }
     'gamble'    { Invoke-Gamble;    $script:ResultCode = $LASTEXITCODE }
     'status'    { Invoke-Status;    $script:ResultCode = $LASTEXITCODE }

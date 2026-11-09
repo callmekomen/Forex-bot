@@ -17,15 +17,34 @@ git clone https://github.com/callmekomen/Forex-bot.git
 cd Forex-bot
 
 powershell -ExecutionPolicy Bypass -File .\forex-bot.ps1 setup
-.\forex-bot.ps1 test          # 85+ tests, all green means the risk engine is sane
+.\forex-bot.ps1 test          # 97 tests, all green means the risk engine is sane
 .\forex-bot.ps1 scan          # gamble ranking board — trades nothing
 .\forex-bot.ps1 gamble -Stake 0.02    # hunt ONE A+ setup (paper, 2% max loss)
 .\forex-bot.ps1 dashboard     # web UI with the big GAMBLE button
 ```
 
-Paper-first by design: nothing reaches a real account unless you pass
-`-Live` *and* type `LIVE` at the prompt. `.\forex-bot.ps1 help` lists
-every command; `Get-Help .\forex-bot.ps1 -Full` shows full help.
+Paper-first by design: nothing reaches a terminal account unless you
+pass `-Live` *and* type `LIVE` at the prompt — and the bot is
+**demo-only**: it reads the MT5 account type at connect and refuses a
+real-money account unless deliberately unlocked
+(`FXBOT_ALLOW_REAL_ACCOUNT=1`, see `forex_bot/README.md` §3c).
+
+## Test on your MT5 demo account
+
+MT5 open and logged into a **$10,000 demo** (risk sizing uses
+`config.account_balance`, so make the demo match), then:
+
+```powershell
+$env:FXBOT_MT5_LOGIN = '12345678'          # your demo login
+$env:FXBOT_MT5_SERVER = 'YourBroker-Demo'  # exact name from MT5's Navigator
+
+.\forex-bot.ps1 check                      # read-only preflight — places NO orders
+.\forex-bot.ps1 scan -Live                 # ranking on real prices, still no trade
+.\forex-bot.ps1 gamble -Live -Stake 0.005  # first demo gamble at a tiny 0.5% stake
+```
+
+`.\forex-bot.ps1 help` lists every command; `Get-Help .\forex-bot.ps1 -Full`
+shows full help.
 
 ## Layout
 

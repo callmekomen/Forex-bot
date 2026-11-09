@@ -104,6 +104,12 @@ class BotConfig:
     mt5_login: Optional[int] = None
     #: also compare the terminal's account currency/server at startup
     require_account_match: bool = True
+    #: DEMO-ONLY LOCK: when False (the default) the feed REFUSES to connect
+    #: for trading if account_info().trade_mode reports a REAL account, so
+    #: a live terminal signed into real money can never be traded by
+    #: accident. Only ever set this (FXBOT_ALLOW_REAL_ACCOUNT=1) after a
+    #: full demo forward test — and understand exactly what it unlocks.
+    allow_real_account: bool = False
     mt5_password: Optional[str] = None
     mt5_server: Optional[str] = None
     mt5_terminal_path: Optional[str] = None
@@ -170,6 +176,7 @@ class BotConfig:
             raise ValueError("gamble_breakeven_r must be positive")
 
         # normalise + auto-detect the MT5 credentials from the environment
+        self.allow_real_account = self._env_bool("allow_real_account", self.allow_real_account)
         self.mt5_login = self._env_int("mt5_login", self.mt5_login)
         self.mt5_password = os.environ.get("FXBOT_MT5_PASSWORD", self.mt5_password)
         self.mt5_server = os.environ.get("FXBOT_MT5_SERVER", self.mt5_server)
@@ -191,6 +198,14 @@ class BotConfig:
         self.pairs = [p.strip().upper() for p in self.pairs if p and p.strip()]
         self.state_file = Path(self.state_file)
         self.log_dir = Path(self.log_dir)
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        """Read a boolean override from ``FXBOT_<NAME>`` (1/true/yes = True)."""
+        raw = os.environ.get(f"FXBOT_{name.upper()}")
+        if raw is None or raw == "":
+            return default
+        return raw.strip().lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def _env_int(name: str, default: Optional[int]) -> Optional[int]:
@@ -271,6 +286,7 @@ class BotConfig:
             f"  trading hours      : {self.start_hour:02d}:00-{self.end_hour:02d}:00 UTC",
             f"  tick interval      : {self.tick_interval}s",
             f"  magic / comment    : {BOT_MAGIC} / {BOT_COMMENT}",
+            f"  account lock       : {'REAL accounts ALLOWED (FXBOT_ALLOW_REAL_ACCOUNT)' if self.allow_real_account else 'DEMO ONLY — real accounts are refused'}",
         ]
         return "\n".join(lines)
 
